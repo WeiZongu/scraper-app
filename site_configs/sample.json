@@ -1,0 +1,18 @@
+{
+  "name": "サンプル(book.toscrape.com)",
+  "list_url": "https://books.toscrape.com/catalogue/page-{page}.html",
+  "item_selector": "article.product_pod",
+  "fields": [
+    {"name": "タイトル", "selector": "h3 a", "attr": "title", "numeric": false},
+    {"name": "価格", "selector": ".price_color", "attr": "text", "numeric": true},
+    {"name": "在庫状況", "selector": ".availability", "attr": "text", "numeric": false},
+    {"name": "リンク", "selector": "h3 a", "attr": "href", "numeric": false}
+  ],
+  "pagination_type": "page_number",
+  "max_pages": 3,
+  "next_button_selector": "",
+  "max_scrolls": 10,
+  "scroll_wait_ms": 1000,
+  "wait_selector": "article.product_pod",
+  "wait_timeout_ms": 15000
+}
