@@ -1,20 +1,25 @@
 """
-SiteConfig に基づいて実際にページを開き、データを抽出するエンジン。
-JavaScriptで動的にコンテンツを描画するサイトを想定し、Playwrightを使用する。
+検索キーワードからWebを検索し、各ページのDOM内から抽出キーワードを含む
+テキストの塊を丸ごと抜き出すエンジン。
+CSSセレクタの指定なしで使えるように、要素の特定はキーワード一致で行う。
 """
 from __future__ import annotations
 
-import re
-import time
-from dataclasses import dataclass
-from typing import Callable, Optional
+from datetime import datetime
+from typing import Callable
+from urllib.parse import quote_plus
 
-from playwright.sync_api import sync_playwright, Page, TimeoutError as PWTimeoutError
+from playwright.sync_api import sync_playwright, Page
 
-from .config import SiteConfig, FieldConfig
+from .config import SearchConfig
 
 # 進捗通知用コールバックの型: (message: str) -> None
 ProgressCallback = Callable[[str], None]
+
+SEARCH_URL = "https://html.duckduckgo.com/html/?q={query}"
+
+# ページ内でキーワード一致を探す際の、抜粋として妥当とみなすテキスト長の範囲
+MIN_SNIPPET_CHARS = 8
 
 
 class ScrapeError(Exception):
@@ -25,159 +30,143 @@ def _noop(_msg: str) -> None:
     pass
 
 
-def _extract_field(item_el, fc: FieldConfig) -> str:
-    """1つの要素(item_el)から1項目分の値を取り出す。"""
+def _search_result_urls(page: Page, keyword: str, max_results: int, on_progress: ProgressCallback) -> list[str]:
+    """DuckDuckGoの検索結果ページから、上位 max_results 件のURLを取得する。"""
+    url = SEARCH_URL.format(query=quote_plus(keyword))
+    on_progress(f"検索中: {keyword}")
+    page.goto(url, timeout=30000)
     try:
-        target = item_el.query_selector(fc.selector) if fc.selector else item_el
+        page.wait_for_selector("a.result__a", timeout=10000)
     except Exception:
-        target = None
-
-    if target is None:
-        return ""
-
-    try:
-        if fc.attr == "text":
-            value = target.inner_text()
-        elif fc.attr == "html":
-            value = target.inner_html()
-        else:
-            value = target.get_attribute(fc.attr) or ""
-    except Exception:
-        value = ""
-
-    return (value or "").strip()
-
-
-def clean_numeric(raw: str) -> Optional[float]:
-    """「¥1,980」「1,980円」などから数値を取り出す。取れなければ None。"""
-    if not raw:
-        return None
-    m = re.search(r"-?\d[\d,]*\.?\d*", raw)
-    if not m:
-        return None
-    try:
-        return float(m.group(0).replace(",", ""))
-    except ValueError:
-        return None
-
-
-def _extract_items(page: Page, cfg: SiteConfig) -> list[dict]:
-    rows = []
-    elements = page.query_selector_all(cfg.item_selector)
-    for el in elements:
-        row = {}
-        for fc in cfg.fields:
-            raw = _extract_field(el, fc)
-            row[fc.name] = raw
-            if fc.numeric:
-                row[f"__num__{fc.name}"] = clean_numeric(raw)
-        rows.append(row)
-    return rows
-
-
-def _wait_for_content(page: Page, cfg: SiteConfig) -> None:
-    selector = cfg.wait_selector.strip() or cfg.item_selector
-    try:
-        page.wait_for_selector(selector, timeout=cfg.wait_timeout_ms)
-    except PWTimeoutError:
-        # 出現しなくても、その時点のDOMから抽出を試みる（0件になる可能性はある）
         pass
+
+    hrefs = page.eval_on_selector_all(
+        "a.result__a",
+        "els => els.map(e => e.href)",
+    )
+    urls: list[str] = []
+    for href in hrefs:
+        if href and href not in urls:
+            urls.append(href)
+        if len(urls) >= max_results:
+            break
+    on_progress(f"  -> 検索結果 {len(urls)} 件を対象にします。")
+    return urls
+
+
+# ブラウザ内(JS)で実行し、キーワードを含む「塊」をまるごと拾ってくる関数。
+# 親要素と子要素の両方が同じキーワードにマッチする場合は、一番内側（子）の
+# 要素だけを採用することで、同じ内容の重複抽出を避ける。
+_EXTRACT_JS = """
+(args) => {
+    const keywords = args.keywords;
+    const minLen = args.minLen;
+    const maxLen = args.maxLen;
+    const results = [];
+    const seen = new Set();
+    const skipTags = new Set(["SCRIPT", "STYLE", "NOSCRIPT", "HEAD"]);
+    const all = document.querySelectorAll("body *");
+
+    for (const el of all) {
+        if (skipTags.has(el.tagName)) continue;
+        const text = (el.innerText || "").replace(/\\s+/g, " ").trim();
+        if (!text || text.length < minLen) continue;
+
+        for (const kw of keywords) {
+            if (!text.includes(kw)) continue;
+
+            // 子要素の中に、同じキーワードを含む要素があれば、
+            // より内側の要素で拾われるはずなのでここではスキップする。
+            let hasMatchingChild = false;
+            for (const child of el.children) {
+                const childText = (child.innerText || "").replace(/\\s+/g, " ").trim();
+                if (childText.length >= minLen && childText.includes(kw)) {
+                    hasMatchingChild = true;
+                    break;
+                }
+            }
+            if (hasMatchingChild) continue;
+
+            const snippet = text.length > maxLen ? text.slice(0, maxLen) + "…" : text;
+            const dedupeKey = kw + "::" + snippet.slice(0, 80);
+            if (seen.has(dedupeKey)) continue;
+            seen.add(dedupeKey);
+            results.push({keyword: kw, text: snippet});
+        }
+    }
+    return results;
+}
+"""
+
+
+def _extract_matches(page: Page, keywords: list[str], max_snippet_chars: int) -> list[dict]:
+    return page.evaluate(
+        _EXTRACT_JS,
+        {"keywords": keywords, "minLen": MIN_SNIPPET_CHARS, "maxLen": max_snippet_chars},
+    )
 
 
 def scrape(
-    cfg: SiteConfig,
-    keyword: str = "",
-    start_page: int = 1,
+    cfg: SearchConfig,
     on_progress: ProgressCallback = _noop,
     headless: bool = True,
 ) -> list[dict]:
     """
-    設定に基づいてスクレイピングを実行し、行データのリストを返す。
-    keyword はURLテンプレート中の {keyword} に、page 番号は {page} に埋め込む。
+    検索キーワードでWebを検索し、上位ページを開いて抽出キーワードに
+    一致するテキストの塊を集める。行データのリストを返す。
     """
-    results: list[dict] = []
-    seen_keys: set[tuple] = set()
+    keywords = [k.strip() for k in cfg.extract_keywords if k.strip()]
+    if not keywords:
+        raise ScrapeError("抽出キーワードを1つ以上入力してください。")
 
-    def add_rows(rows: list[dict]):
-        added = 0
-        for r in rows:
-            key = tuple(r.get(fc.name, "") for fc in cfg.fields)
-            if key in seen_keys:
-                continue
-            seen_keys.add(key)
-            results.append(r)
-            added += 1
-        return added
+    results: list[dict] = []
+    seen_texts: set[str] = set()
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=headless)
         page = browser.new_page()
 
         try:
-            if cfg.pagination_type == "page_number":
-                for page_num in range(start_page, start_page + cfg.max_pages):
-                    url = cfg.list_url.format(page=page_num, keyword=keyword)
-                    on_progress(f"[{cfg.name}] {page_num}ページ目を取得中: {url}")
-                    page.goto(url, timeout=30000)
-                    _wait_for_content(page, cfg)
-                    rows = _extract_items(page, cfg)
-                    added = add_rows(rows)
-                    on_progress(f"  -> {len(rows)}件検出（新規 {added}件）")
-                    if added == 0:
-                        on_progress("  新規データなし。ページングを終了します。")
-                        break
+            urls = _search_result_urls(page, cfg.search_keyword, cfg.max_pages, on_progress)
+            if not urls:
+                on_progress("検索結果が見つかりませんでした。")
 
-            elif cfg.pagination_type == "click_next":
-                url = cfg.list_url.format(page=start_page, keyword=keyword)
-                on_progress(f"[{cfg.name}] 初期ページを取得中: {url}")
-                page.goto(url, timeout=30000)
-                _wait_for_content(page, cfg)
+            for i, url in enumerate(urls, start=1):
+                on_progress(f"[{i}/{len(urls)}] ページを取得中: {url}")
+                try:
+                    page.goto(url, timeout=20000)
+                    page.wait_for_timeout(500)
+                except Exception as e:
+                    on_progress(f"  -> 取得失敗: {e}")
+                    continue
 
-                for i in range(cfg.max_pages):
-                    rows = _extract_items(page, cfg)
-                    added = add_rows(rows)
-                    on_progress(f"[{cfg.name}] {i + 1}ページ目: {len(rows)}件検出（新規 {added}件）")
-                    if added == 0 and i > 0:
-                        on_progress("  新規データなし。ページングを終了します。")
-                        break
-                    next_btn = page.query_selector(cfg.next_button_selector)
-                    if not next_btn:
-                        on_progress("  「次へ」ボタンが見つかりません。終了します。")
-                        break
-                    try:
-                        next_btn.click()
-                        page.wait_for_timeout(cfg.scroll_wait_ms)
-                        _wait_for_content(page, cfg)
-                    except Exception as e:
-                        on_progress(f"  クリックに失敗: {e}")
-                        break
+                title = ""
+                try:
+                    title = page.title()
+                except Exception:
+                    pass
 
-            elif cfg.pagination_type == "infinite_scroll":
-                url = cfg.list_url.format(page=start_page, keyword=keyword)
-                on_progress(f"[{cfg.name}] ページを取得中: {url}")
-                page.goto(url, timeout=30000)
-                _wait_for_content(page, cfg)
+                try:
+                    matches = _extract_matches(page, keywords, cfg.max_snippet_chars)
+                except Exception as e:
+                    on_progress(f"  -> 抽出失敗: {e}")
+                    continue
 
-                prev_count = 0
-                for i in range(cfg.max_scrolls):
-                    rows = _extract_items(page, cfg)
-                    add_rows(rows)
-                    on_progress(f"[{cfg.name}] スクロール{i + 1}回目: 累計 {len(results)}件")
-                    if len(rows) == prev_count:
-                        on_progress("  これ以上増えないため終了します。")
-                        break
-                    prev_count = len(rows)
-                    page.mouse.wheel(0, 4000)
-                    page.wait_for_timeout(cfg.scroll_wait_ms)
-
-            else:  # "none" 単一ページ
-                url = cfg.list_url.format(page=start_page, keyword=keyword)
-                on_progress(f"[{cfg.name}] ページを取得中: {url}")
-                page.goto(url, timeout=30000)
-                _wait_for_content(page, cfg)
-                rows = _extract_items(page, cfg)
-                add_rows(rows)
-                on_progress(f"  -> {len(rows)}件検出")
+                added = 0
+                for m in matches:
+                    dedupe_key = f"{m['keyword']}::{m['text']}"
+                    if dedupe_key in seen_texts:
+                        continue
+                    seen_texts.add(dedupe_key)
+                    results.append({
+                        "keyword": m["keyword"],
+                        "text": m["text"],
+                        "title": title,
+                        "url": url,
+                        "fetched_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    })
+                    added += 1
+                on_progress(f"  -> {added}件抽出（累計 {len(results)}件）")
 
         finally:
             browser.close()

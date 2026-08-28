@@ -1,9 +1,10 @@
 """
-マルチサイト対応スクレイピングGUIアプリ（Flet製）
+キーワードだけで使えるWeb検索・抽出GUIアプリ（Flet製）
 
-- サイトごとにCSSセレクタ設定をJSONで保存・呼び出し
+- CSSセレクタの指定は不要。検索キーワードでWebを検索し、
+  各ページの中から抽出キーワードを含むテキストの塊をまるごと拾う。
 - Playwrightで動的コンテンツ(JS描画)にも対応
-- 結果をプレビュー後、集計・グラフ付きのExcel帳票として出力
+- 結果をプレビュー後、すっきりした一覧形式のExcel帳票として出力
 """
 from __future__ import annotations
 
@@ -15,7 +16,7 @@ from pathlib import Path
 
 import flet as ft
 
-from scraper.config import SiteConfig, FieldConfig, list_configs, save_config, delete_config
+from scraper.config import SearchConfig, list_configs, save_config, delete_config
 from scraper.engine import scrape
 from scraper.exporter import export_report
 
@@ -26,33 +27,30 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 APP_PASSWORD = os.environ.get("APP_PASSWORD", "")  # 空文字なら認証なし
 
-PAGINATION_LABELS = {
-    "page_number": "URLのページ番号送り（{page}）",
-    "click_next": "「次へ」ボタンをクリック",
-    "infinite_scroll": "無限スクロール",
-    "none": "単一ページのみ",
-}
+PREVIEW_COLUMNS = ["keyword", "text", "title", "url", "fetched_at"]
+PREVIEW_LABELS = ["キーワード", "抜粋テキスト", "ページタイトル", "URL", "取得日時"]
 
 
 def build_app(page: ft.Page):
-    page.title = "サイト別スクレイピングツール"
+    page.title = "キーワード検索・抽出ツール"
     page.window.width = 1200
     page.window.height = 800
     page.padding = 10
     page.scroll = ft.ScrollMode.AUTO
 
-    state = {"fields": [], "current_config_name": None, "last_rows": []}
+    state = {"current_config_name": None, "last_rows": []}
 
-    # ---------------- 左: サイト一覧 ----------------
+    # ---------------- 左: 検索設定一覧 ----------------
     site_list = ft.ListView(expand=True, spacing=4)
 
     def refresh_site_list():
         site_list.controls.clear()
         for cfg in list_configs():
+            subtitle = f"検索: {cfg.search_keyword} / 抽出: {', '.join(cfg.extract_keywords)}"
             site_list.controls.append(
                 ft.ListTile(
                     title=ft.Text(cfg.name),
-                    subtitle=ft.Text(cfg.list_url, size=10, color=ft.Colors.GREY),
+                    subtitle=ft.Text(subtitle, size=10, color=ft.Colors.GREY),
                     on_click=lambda e, c=cfg: load_into_form(c),
                     trailing=ft.IconButton(
                         icon=ft.Icons.DELETE_OUTLINE,
@@ -80,7 +78,7 @@ def build_app(page: ft.Page):
                 on_click=lambda e: None,
             )
         ]
-        status_text.value = f"{len(configs)}件のサイト設定をバックアップファイルにまとめました。下のリンクからダウンロードしてください。"
+        status_text.value = f"{len(configs)}件の検索設定をバックアップファイルにまとめました。下のリンクからダウンロードしてください。"
         page.update()
 
     file_picker = ft.FilePicker()
@@ -94,10 +92,10 @@ def build_app(page: ft.Page):
                 data = json.loads(uploaded_path.read_text(encoding="utf-8"))
                 count = 0
                 for d in data:
-                    save_config(SiteConfig.from_dict(d))
+                    save_config(SearchConfig.from_dict(d))
                     count += 1
                 refresh_site_list()
-                status_text.value = f"{count}件のサイト設定を復元しました。"
+                status_text.value = f"{count}件の検索設定を復元しました。"
             except Exception as ex:
                 status_text.value = f"インポートに失敗しました: {ex}"
             page.update()
@@ -112,129 +110,49 @@ def build_app(page: ft.Page):
         upload_url = page.get_upload_url(f.name, 600)
         await file_picker.upload([ft.FilePickerUploadFile(name=f.name, upload_url=upload_url)])
 
-    # ---------------- 右: サイト設定フォーム ----------------
-    name_field = ft.TextField(label="サイト名", expand=True)
-    url_field = ft.TextField(
-        label="一覧ページURL（{page} でページ番号、{keyword} でキーワードを埋め込み可）",
+    # ---------------- 右: 検索設定フォーム ----------------
+    name_field = ft.TextField(label="設定名", expand=True)
+    search_keyword_field = ft.TextField(
+        label="検索キーワード（Webを検索するためのキーワード）",
         expand=True,
-        hint_text="https://example.com/search?q={keyword}&page={page}",
+        hint_text="例: 東京 ラーメン 新宿",
     )
-    item_selector_field = ft.TextField(label="1件分を囲むCSSセレクタ", expand=True, hint_text=".product-card")
-    wait_selector_field = ft.TextField(label="描画完了を待つCSSセレクタ（空欄なら上と同じ）", expand=True)
-    wait_timeout_field = ft.TextField(label="待機タイムアウト(ms)", expand=True, value="15000")
-
-    pagination_dd = ft.Dropdown(
-        label="ページング方式",
+    extract_keywords_field = ft.TextField(
+        label="抽出キーワード（カンマ区切りで複数可。このキーワードを含む文章の塊を丸ごと抜き出します）",
         expand=True,
-        options=[ft.dropdown.Option(k, v) for k, v in PAGINATION_LABELS.items()],
-        value="page_number",
+        hint_text="例: 営業時間, 定休日, 住所",
     )
-    max_pages_field = ft.TextField(label="最大ページ数", expand=True, value="5")
-    next_button_field = ft.TextField(label="「次へ」ボタンのCSSセレクタ", expand=True, visible=False)
-    max_scrolls_field = ft.TextField(label="最大スクロール回数", expand=True, value="10", visible=False)
-    scroll_wait_field = ft.TextField(label="スクロール後の待機(ms)", expand=True, value="1000", visible=False)
+    max_pages_field = ft.TextField(label="検索結果から開くページ数", expand=True, value="5")
 
-    def on_pagination_change(e):
-        v = pagination_dd.value
-        next_button_field.visible = v == "click_next"
-        max_pages_field.visible = v in ("page_number", "click_next")
-        max_scrolls_field.visible = v == "infinite_scroll"
-        scroll_wait_field.visible = v == "infinite_scroll"
-        page.update()
-
-    pagination_dd.on_change = on_pagination_change
-
-    # ---- 取得項目（フィールド）編集 ----
-    fields_column = ft.Column(spacing=6)
-
-    def render_fields():
-        fields_column.controls.clear()
-        for i, f in enumerate(state["fields"]):
-            fields_column.controls.append(_field_row(i, f))
-        page.update()
-
-    def _field_row(i, f: dict):
-        name_tf = ft.TextField(label="列名", value=f.get("name", ""), dense=True, col={"xs": 12, "sm": 6, "md": 2},
-                                on_change=lambda e: f.__setitem__("name", e.control.value))
-        sel_tf = ft.TextField(label="相対CSSセレクタ", value=f.get("selector", ""), dense=True, col={"xs": 12, "sm": 6, "md": 3},
-                               on_change=lambda e: f.__setitem__("selector", e.control.value))
-        attr_tf = ft.TextField(label="取得方法(text/html/属性名)", value=f.get("attr", "text"), dense=True, col={"xs": 12, "sm": 6, "md": 3},
-                                on_change=lambda e: f.__setitem__("attr", e.control.value))
-        numeric_cb = ft.Checkbox(label="数値として集計", value=f.get("numeric", False), col={"xs": 8, "sm": 4, "md": 2},
-                                  on_change=lambda e: f.__setitem__("numeric", e.control.value))
-
-        def remove(e):
-            state["fields"].pop(i)
-            render_fields()
-
-        return ft.ResponsiveRow(
-            [name_tf, sel_tf, attr_tf, numeric_cb,
-             ft.Container(ft.IconButton(icon=ft.Icons.CLOSE, icon_size=18, on_click=remove), col={"xs": 4, "sm": 2, "md": 2})],
-            spacing=8,
-        )
-
-    def add_field(e):
-        state["fields"].append({"name": "", "selector": "", "attr": "text", "numeric": False})
-        render_fields()
-
-    def load_into_form(cfg: SiteConfig):
+    def load_into_form(cfg: SearchConfig):
         state["current_config_name"] = cfg.name
         name_field.value = cfg.name
-        url_field.value = cfg.list_url
-        item_selector_field.value = cfg.item_selector
-        wait_selector_field.value = cfg.wait_selector
-        wait_timeout_field.value = str(cfg.wait_timeout_ms)
-        pagination_dd.value = cfg.pagination_type
+        search_keyword_field.value = cfg.search_keyword
+        extract_keywords_field.value = ", ".join(cfg.extract_keywords)
         max_pages_field.value = str(cfg.max_pages)
-        next_button_field.value = cfg.next_button_selector
-        max_scrolls_field.value = str(cfg.max_scrolls)
-        scroll_wait_field.value = str(cfg.scroll_wait_ms)
-        state["fields"] = [f.to_dict() for f in cfg.fields]
-        on_pagination_change(None)
-        render_fields()
-        tabs.selected_index = 1  # 「サイト設定」タブへ切り替え
+        tabs.selected_index = 1  # 「検索設定」タブへ切り替え
         page.update()
 
     def clear_form(e=None):
         state["current_config_name"] = None
         name_field.value = ""
-        url_field.value = ""
-        item_selector_field.value = ""
-        wait_selector_field.value = ""
-        wait_timeout_field.value = "15000"
-        pagination_dd.value = "page_number"
+        search_keyword_field.value = ""
+        extract_keywords_field.value = ""
         max_pages_field.value = "5"
-        next_button_field.value = ""
-        max_scrolls_field.value = "10"
-        scroll_wait_field.value = "1000"
-        state["fields"] = []
-        render_fields()
-        on_pagination_change(None)
         page.update()
 
-    def build_config_from_form() -> SiteConfig:
-        fields = [
-            FieldConfig(name=f["name"], selector=f["selector"], attr=f.get("attr", "text") or "text",
-                        numeric=f.get("numeric", False))
-            for f in state["fields"] if f.get("name")
-        ]
-        return SiteConfig(
+    def build_config_from_form() -> SearchConfig:
+        extract_keywords = [k.strip() for k in extract_keywords_field.value.split(",") if k.strip()]
+        return SearchConfig(
             name=name_field.value.strip(),
-            list_url=url_field.value.strip(),
-            item_selector=item_selector_field.value.strip(),
-            fields=fields,
-            pagination_type=pagination_dd.value,
+            search_keyword=search_keyword_field.value.strip(),
+            extract_keywords=extract_keywords,
             max_pages=int(max_pages_field.value or 5),
-            next_button_selector=next_button_field.value.strip(),
-            max_scrolls=int(max_scrolls_field.value or 10),
-            scroll_wait_ms=int(scroll_wait_field.value or 1000),
-            wait_selector=wait_selector_field.value.strip(),
-            wait_timeout_ms=int(wait_timeout_field.value or 15000),
         )
 
     def on_save(e):
         if not name_field.value.strip():
-            status_text.value = "サイト名を入力してください。"
+            status_text.value = "設定名を入力してください。"
             page.update()
             return
         cfg = build_config_from_form()
@@ -244,8 +162,6 @@ def build_app(page: ft.Page):
         page.update()
 
     # ---------------- 実行セクション ----------------
-    keyword_field = ft.TextField(label="キーワード（{keyword} を使う場合）", expand=True)
-    start_page_field = ft.TextField(label="開始ページ", expand=True, value="1")
     headless_cb = ft.Checkbox(label="ブラウザを表示せず実行(headless)", value=True)
     run_button = ft.ElevatedButton("実行", icon=ft.Icons.PLAY_ARROW)
     export_button = ft.ElevatedButton("帳票出力(Excel)", icon=ft.Icons.TABLE_CHART, disabled=True)
@@ -258,21 +174,20 @@ def build_app(page: ft.Page):
         log_view.controls.append(ft.Text(msg, size=11, font_family="monospace"))
         page.update()
 
-    preview_table = ft.DataTable(columns=[ft.DataColumn(ft.Text(""))], rows=[])
+    preview_table = ft.DataTable(columns=[ft.DataColumn(ft.Text(l)) for l in PREVIEW_LABELS], rows=[])
     preview_container = ft.Column([preview_table], scroll=ft.ScrollMode.AUTO)
 
-    def render_preview(field_names: list[str], rows: list[dict]):
-        preview_table.columns = [ft.DataColumn(ft.Text(n)) for n in field_names] or [ft.DataColumn(ft.Text("(項目なし)"))]
+    def render_preview(rows: list[dict]):
         preview_table.rows = [
-            ft.DataRow(cells=[ft.DataCell(ft.Text(str(r.get(n, "")))) for n in field_names])
+            ft.DataRow(cells=[ft.DataCell(ft.Text(str(r.get(c, "")))) for c in PREVIEW_COLUMNS])
             for r in rows[:200]  # プレビューは最大200件
         ]
         page.update()
 
     def do_run(e):
         cfg = build_config_from_form()
-        if not cfg.name or not cfg.list_url or not cfg.item_selector or not cfg.fields:
-            status_text.value = "サイト名・URL・アイテムセレクタ・取得項目を入力してください。"
+        if not cfg.name or not cfg.search_keyword or not cfg.extract_keywords:
+            status_text.value = "設定名・検索キーワード・抽出キーワードを入力してください。"
             page.update()
             return
 
@@ -287,14 +202,12 @@ def build_app(page: ft.Page):
             try:
                 rows = scrape(
                     cfg,
-                    keyword=keyword_field.value.strip(),
-                    start_page=int(start_page_field.value or 1),
                     on_progress=log,
                     headless=headless_cb.value,
                 )
                 state["last_rows"] = rows
                 state["last_cfg"] = cfg
-                render_preview([f.name for f in cfg.fields], rows)
+                render_preview(rows)
                 status_text.value = f"完了: {len(rows)} 件取得しました。"
                 export_button.disabled = len(rows) == 0
             except Exception as ex:
@@ -333,7 +246,7 @@ def build_app(page: ft.Page):
 
     # ---------------- レイアウト組み立て（スマホ幅でも使えるようタブ構成） ----------------
     site_list_view = ft.Column([
-        ft.ElevatedButton("＋ 新規サイト", icon=ft.Icons.ADD, on_click=clear_form),
+        ft.ElevatedButton("＋ 新規設定", icon=ft.Icons.ADD, on_click=clear_form),
         ft.Row([
             ft.OutlinedButton("設定をバックアップ", icon=ft.Icons.DOWNLOAD, on_click=do_backup),
             ft.OutlinedButton("設定を復元", icon=ft.Icons.UPLOAD, on_click=on_pick_click),
@@ -346,34 +259,19 @@ def build_app(page: ft.Page):
     ], expand=True)
 
     editor_view = ft.Column([
-        ft.Text("サイト設定", weight=ft.FontWeight.BOLD, size=16),
+        ft.Text("検索設定", weight=ft.FontWeight.BOLD, size=16),
         ft.ResponsiveRow([ft.Container(name_field, col=12)]),
-        ft.ResponsiveRow([ft.Container(url_field, col=12)]),
-        ft.ResponsiveRow([
-            ft.Container(item_selector_field, col={"xs": 12, "md": 5}),
-            ft.Container(wait_selector_field, col={"xs": 12, "md": 5}),
-            ft.Container(wait_timeout_field, col={"xs": 12, "md": 2}),
-        ]),
-        ft.ResponsiveRow([
-            ft.Container(pagination_dd, col={"xs": 12, "sm": 6, "md": 3}),
-            ft.Container(max_pages_field, col={"xs": 12, "sm": 6, "md": 2}),
-            ft.Container(next_button_field, col={"xs": 12, "sm": 6, "md": 3}),
-            ft.Container(max_scrolls_field, col={"xs": 12, "sm": 6, "md": 2}),
-            ft.Container(scroll_wait_field, col={"xs": 12, "sm": 6, "md": 2}),
-        ]),
-        ft.Divider(),
-        ft.Row([ft.Text("取得項目", weight=ft.FontWeight.BOLD), ft.IconButton(icon=ft.Icons.ADD, on_click=add_field)]),
-        fields_column,
+        ft.ResponsiveRow([ft.Container(search_keyword_field, col=12)]),
+        ft.ResponsiveRow([ft.Container(extract_keywords_field, col=12)]),
+        ft.ResponsiveRow([ft.Container(max_pages_field, col={"xs": 12, "sm": 6, "md": 3})]),
         ft.ElevatedButton("設定を保存", icon=ft.Icons.SAVE, on_click=on_save),
     ], expand=True, scroll=ft.ScrollMode.AUTO)
 
     run_view = ft.Column([
         ft.Text("実行", weight=ft.FontWeight.BOLD, size=16),
-        ft.Text("※実行するサイトは「サイト設定」タブで選択・保存したものが対象です", size=11, color=ft.Colors.GREY),
+        ft.Text("※実行する設定は「検索設定」タブで選択・保存したものが対象です", size=11, color=ft.Colors.GREY),
         ft.ResponsiveRow([
-            ft.Container(keyword_field, col={"xs": 12, "sm": 6}),
-            ft.Container(start_page_field, col={"xs": 6, "sm": 3}),
-            ft.Container(headless_cb, col={"xs": 6, "sm": 3}),
+            ft.Container(headless_cb, col={"xs": 12, "sm": 6}),
         ]),
         ft.Row([run_button, progress_ring, export_button], wrap=True),
         export_link,
@@ -393,8 +291,8 @@ def build_app(page: ft.Page):
             controls=[
                 ft.TabBar(
                     tabs=[
-                        ft.Tab(label="サイト一覧"),
-                        ft.Tab(label="サイト設定"),
+                        ft.Tab(label="検索設定一覧"),
+                        ft.Tab(label="検索設定"),
                         ft.Tab(label="実行・結果"),
                     ],
                 ),
@@ -413,7 +311,6 @@ def build_app(page: ft.Page):
     page.add(tabs)
 
     refresh_site_list()
-    render_fields()
 
 
 def main(page: ft.Page):
@@ -422,7 +319,7 @@ def main(page: ft.Page):
         build_app(page)
         return
 
-    page.title = "サイト別スクレイピングツール"
+    page.title = "キーワード検索・抽出ツール"
     pw_field = ft.TextField(label="パスワード", password=True, can_reveal_password=True, width=280,
                              on_submit=lambda e: try_login(None))
     error_text = ft.Text("", color=ft.Colors.RED)
