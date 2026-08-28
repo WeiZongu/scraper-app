@@ -388,12 +388,28 @@ def build_app(page: ft.Page):
 
     tabs = ft.Tabs(
         selected_index=0,
+        length=3,
         expand=True,
-        tabs=[
-            ft.Tab(text="サイト一覧", content=ft.Container(site_list_view, padding=10)),
-            ft.Tab(text="サイト設定", content=ft.Container(editor_view, padding=10)),
-            ft.Tab(text="実行・結果", content=ft.Container(run_view, padding=10)),
-        ],
+        content=ft.Column(
+            expand=True,
+            controls=[
+                ft.TabBar(
+                    tabs=[
+                        ft.Tab(label="サイト一覧"),
+                        ft.Tab(label="サイト設定"),
+                        ft.Tab(label="実行・結果"),
+                    ],
+                ),
+                ft.TabBarView(
+                    expand=True,
+                    controls=[
+                        ft.Container(site_list_view, padding=10),
+                        ft.Container(editor_view, padding=10),
+                        ft.Container(run_view, padding=10),
+                    ],
+                ),
+            ],
+        ),
     )
 
     page.add(tabs)
