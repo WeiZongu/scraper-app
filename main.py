@@ -84,7 +84,7 @@ def build_app(page: ft.Page):
         page.update()
 
     file_picker = ft.FilePicker()
-    page.overlay.append(file_picker)
+    page.services.append(file_picker)
 
     def on_upload_progress(e: ft.FilePickerUploadEvent):
         if e.progress == 1:
@@ -104,14 +104,13 @@ def build_app(page: ft.Page):
 
     file_picker.on_upload = on_upload_progress
 
-    def on_pick_result(e: ft.FilePickerResultEvent):
-        if not e.files:
+    async def on_pick_click(e):
+        files = await file_picker.pick_files(allow_multiple=False, allowed_extensions=["json"])
+        if not files:
             return
-        f = e.files[0]
+        f = files[0]
         upload_url = page.get_upload_url(f.name, 600)
-        file_picker.upload([ft.FilePickerUploadFile(name=f.name, upload_url=upload_url)])
-
-    file_picker.on_result = on_pick_result
+        await file_picker.upload([ft.FilePickerUploadFile(name=f.name, upload_url=upload_url)])
 
     # ---------------- 右: サイト設定フォーム ----------------
     name_field = ft.TextField(label="サイト名", expand=True)
@@ -337,8 +336,7 @@ def build_app(page: ft.Page):
         ft.ElevatedButton("＋ 新規サイト", icon=ft.Icons.ADD, on_click=clear_form),
         ft.Row([
             ft.OutlinedButton("設定をバックアップ", icon=ft.Icons.DOWNLOAD, on_click=do_backup),
-            ft.OutlinedButton("設定を復元", icon=ft.Icons.UPLOAD,
-                               on_click=lambda e: file_picker.pick_files(allow_multiple=False, allowed_extensions=["json"])),
+            ft.OutlinedButton("設定を復元", icon=ft.Icons.UPLOAD, on_click=on_pick_click),
         ], wrap=True),
         backup_link,
         ft.Text("※クラウド無料枠は再起動でデータが消えることがあります。定期的にバックアップしてください。",
