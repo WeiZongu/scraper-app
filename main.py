@@ -381,9 +381,9 @@ def build_app(page: ft.Page):
         export_link,
         status_text,
         ft.Text("実行ログ", size=12, color=ft.Colors.GREY),
-        ft.Container(log_view, border=ft.border.all(1, ft.Colors.GREY_300), padding=6),
+        ft.Container(log_view, border=ft.Border.all(1, ft.Colors.GREY_300), padding=6),
         ft.Text("プレビュー（最大200件・横スクロール可）", size=12, color=ft.Colors.GREY),
-        ft.Container(preview_container, border=ft.border.all(1, ft.Colors.GREY_300), padding=6, height=300),
+        ft.Container(preview_container, border=ft.Border.all(1, ft.Colors.GREY_300), padding=6, height=300),
     ], expand=True, scroll=ft.ScrollMode.AUTO)
 
     tabs = ft.Tabs(
