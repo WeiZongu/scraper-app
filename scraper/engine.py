@@ -113,19 +113,22 @@ def _serper_search_urls(keyword: str, on_progress: ProgressCallback) -> list[str
     return urls
 
 
-# ブラウザ内(JS)で実行し、キーワードを含む「塊」をまるごと拾ってくる関数。
-# 親要素と子要素の両方が同じキーワードにマッチする場合は、一番内側（子）の
-# 要素だけを採用することで、同じ内容の重複抽出を避ける。
+# ブラウザ内(JS)で実行し、キーワードを含む「塊」を拾ってくる関数。
+# 1. まず各キーワードについて、一致する最も内側の要素（1行程度）を見つける。
+# 2. そこから、意味のあるまとまり（段落程度）になるまで親要素を数階層たどって
+#    範囲を広げる（1行だけだと情報が少なすぎるため）。
+# 3. 複数のキーワードが広げた結果、同じ段落に行き着いた場合は1件にまとめ、
+#    キーワードを併記する（重複データを作らないため）。
 _EXTRACT_JS = """
 (args) => {
     const keywords = args.keywords;
     const minLen = args.minLen;
     const maxLen = args.maxLen;
-    const results = [];
-    const seen = new Set();
     const skipTags = new Set(["SCRIPT", "STYLE", "NOSCRIPT", "HEAD"]);
     const all = document.querySelectorAll("body *");
 
+    // 1. 各キーワードについて、一致する最も内側の要素を集める
+    const leafMatches = [];
     for (const el of all) {
         if (skipTags.has(el.tagName)) continue;
         const text = (el.innerText || "").replace(/\\s+/g, " ").trim();
@@ -133,9 +136,6 @@ _EXTRACT_JS = """
 
         for (const kw of keywords) {
             if (!text.includes(kw)) continue;
-
-            // 子要素の中に、同じキーワードを含む要素があれば、
-            // より内側の要素で拾われるはずなのでここではスキップする。
             let hasMatchingChild = false;
             for (const child of el.children) {
                 const childText = (child.innerText || "").replace(/\\s+/g, " ").trim();
@@ -145,39 +145,73 @@ _EXTRACT_JS = """
                 }
             }
             if (hasMatchingChild) continue;
-
-            const snippet = text.length > maxLen ? text.slice(0, maxLen) + "…" : text;
-            const dedupeKey = kw + "::" + snippet.slice(0, 80);
-            if (seen.has(dedupeKey)) continue;
-            seen.add(dedupeKey);
-
-            // マッチしたテキストの塊の中、またはそのすぐ近く（数階層上の親要素まで）に
-            // ある画像・動画だけを「関連メディア」として拾う。画像・商品写真は同じ
-            // カード/記事コンテナ内で見出しやテキストの「兄弟要素」になっていることが
-            // 多いため、el自身だけでなく少し上の階層まで確認する。ページ全体は見ない。
-            let imageUrl = "";
-            let videoUrl = "";
-            let container = el;
-            for (let hops = 0; hops < 3 && container; hops++) {
-                const img = container.querySelector("img[src]");
-                const video = container.querySelector("video");
-                if (img || video) {
-                    if (img) imageUrl = img.src;
-                    if (video) {
-                        videoUrl = video.currentSrc || "";
-                        if (!videoUrl) {
-                            const source = video.querySelector("source[src]");
-                            if (source) videoUrl = source.src;
-                        }
-                        if (!imageUrl && video.poster) imageUrl = video.poster;
-                    }
-                    break;
-                }
-                container = container.parentElement;
-            }
-
-            results.push({keyword: kw, text: snippet, imageUrl: imageUrl, videoUrl: videoUrl});
+            leafMatches.push({el: el, keyword: kw});
         }
+    }
+
+    // 2. 段落程度のまとまりになるまで親要素をたどって範囲を広げる
+    //    （広げすぎて無関係な内容まで含めないよう、上限も設ける）
+    const containers = new Map(); // 要素 -> {keywords: Set, text: string}
+    for (const {el, keyword} of leafMatches) {
+        let container = el;
+        // 広げすぎて無関係な兄弟要素（別の商品カード等）まで含めてしまわないよう、
+        // 親を1階層だけたどる（多くのサイトで、これが「1件分の情報」の
+        // カード/行を囲む単位になっていることが多い）。
+        for (let hops = 0; hops < 1; hops++) {
+            const parent = container.parentElement;
+            if (!parent) break;
+            const parentText = (parent.innerText || "").replace(/\\s+/g, " ").trim();
+            if (!parentText || parentText.length > maxLen * 1.5) break;
+            container = parent;
+        }
+
+        if (containers.has(container)) {
+            containers.get(container).keywords.add(keyword);
+        } else {
+            const containerText = (container.innerText || "").replace(/\\s+/g, " ").trim();
+            containers.set(container, {
+                keywords: new Set([keyword]),
+                text: containerText.length > maxLen ? containerText.slice(0, maxLen) + "…" : containerText,
+            });
+        }
+    }
+
+    // 3. 画像・動画の関連付け（まとめた段落の中、またはその近くの親要素まで）
+    //    と、テキスト内容そのものによる重複排除を行いつつ結果を組み立てる
+    const seenText = new Set();
+    const results = [];
+    for (const [container, data] of containers.entries()) {
+        const dedupeKey = data.text.slice(0, 120);
+        if (seenText.has(dedupeKey)) continue;
+        seenText.add(dedupeKey);
+
+        let imageUrl = "";
+        let videoUrl = "";
+        let mediaContainer = container;
+        for (let hops = 0; hops < 3 && mediaContainer; hops++) {
+            const img = mediaContainer.querySelector("img[src]");
+            const video = mediaContainer.querySelector("video");
+            if (img || video) {
+                if (img) imageUrl = img.src;
+                if (video) {
+                    videoUrl = video.currentSrc || "";
+                    if (!videoUrl) {
+                        const source = video.querySelector("source[src]");
+                        if (source) videoUrl = source.src;
+                    }
+                    if (!imageUrl && video.poster) imageUrl = video.poster;
+                }
+                break;
+            }
+            mediaContainer = mediaContainer.parentElement;
+        }
+
+        results.push({
+            keyword: Array.from(data.keywords).join(", "),
+            text: data.text,
+            imageUrl: imageUrl,
+            videoUrl: videoUrl,
+        });
     }
     return results;
 }
@@ -242,7 +276,10 @@ def scrape(
 
                 added = 0
                 for m in matches:
-                    dedupe_key = f"{m['keyword']}::{m['text']}"
+                    # サイト内の別ページに同じ文章（フッターの住所など）が
+                    # 繰り返し出てくることがあるため、テキスト内容だけで
+                    # サイト全体を通して重複排除する。
+                    dedupe_key = m["text"]
                     if dedupe_key in seen_texts:
                         continue
                     seen_texts.add(dedupe_key)

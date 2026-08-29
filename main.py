@@ -4,7 +4,7 @@
 - CSSセレクタの指定は不要。検索キーワードでWebを検索し、
   各ページの中から抽出キーワードを含むテキストの塊をまるごと拾う。
 - Playwrightで動的コンテンツ(JS描画)にも対応
-- 結果をプレビュー後、すっきりした一覧形式のExcel帳票として出力
+- 結果をプレビュー後、1件1スライドの要約されたPowerPointスライドとして出力
 """
 from __future__ import annotations
 
@@ -164,7 +164,7 @@ def build_app(page: ft.Page):
 
     # ---------------- 実行セクション ----------------
     run_button = ft.ElevatedButton("実行", icon=ft.Icons.PLAY_ARROW)
-    export_button = ft.ElevatedButton("帳票出力(Excel)", icon=ft.Icons.TABLE_CHART, disabled=True)
+    export_button = ft.ElevatedButton("スライド出力(PowerPoint)", icon=ft.Icons.SLIDESHOW, disabled=True)
     progress_ring = ft.ProgressRing(visible=False, width=20, height=20)
     status_text = ft.Text("", color=ft.Colors.BLUE_GREY)
 
@@ -235,19 +235,19 @@ def build_app(page: ft.Page):
             status_text.value = "先にデータを取得してください。"
             page.update()
             return
-        filename = f"{cfg.name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        filename = f"{cfg.name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pptx"
         out_path = OUTPUT_DIR / filename
-        logger.info("帳票出力を開始します: %s（%d件）", filename, len(rows))
+        logger.info("スライド出力を開始します: %s（%d件）", filename, len(rows))
         try:
             export_report(cfg, rows, out_path)
-            logger.info("帳票出力が完了しました: %s", filename)
-            status_text.value = "帳票を出力しました。下のリンクからダウンロードしてください。"
+            logger.info("スライド出力が完了しました: %s", filename)
+            status_text.value = "スライドを出力しました。下のリンクからダウンロードしてください。"
             export_link.controls = [
                 ft.TextButton(f"↓ {filename} をダウンロード", url=f"/output/{filename}")
             ]
         except Exception as ex:
             logger.exception("export_report() failed")
-            status_text.value = f"帳票出力エラー: {ex}"
+            status_text.value = f"スライド出力エラー: {ex}"
         page.update()
 
     run_button.on_click = do_run
