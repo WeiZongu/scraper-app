@@ -8,6 +8,7 @@
 """
 from __future__ import annotations
 
+import logging
 import os
 import threading
 import traceback
@@ -24,6 +25,11 @@ APP_DIR = Path(__file__).resolve().parent
 ASSETS_DIR = APP_DIR / "assets"
 OUTPUT_DIR = ASSETS_DIR / "output"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+# 実行ログを標準出力にも残す（クラウドのログ画面から後で確認できるようにするため。
+# 画面上の「実行ログ」はブラウザを閉じると消えてしまうが、こちらは残る）。
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger("scraper_app")
 
 APP_PASSWORD = os.environ.get("APP_PASSWORD", "")  # 空文字なら認証なし
 
@@ -165,6 +171,7 @@ def build_app(page: ft.Page):
     log_view = ft.ListView(height=180, spacing=2, auto_scroll=True)
 
     def log(msg: str):
+        logger.info(msg)
         log_view.controls.append(ft.Text(msg, size=11, font_family="monospace"))
         page.update()
 
@@ -206,7 +213,12 @@ def build_app(page: ft.Page):
                 export_button.disabled = len(rows) == 0
             except Exception as ex:
                 status_text.value = f"エラーが発生しました: {ex}"
-                log("".join(traceback.format_exc().splitlines()[-5:]))
+                # 画面には要点だけ、サーバー側のログには完全なトレースバックを残す
+                logger.exception("scrape() failed")
+                log_view.controls.append(
+                    ft.Text("\n".join(traceback.format_exc().splitlines()[-5:]), size=11, font_family="monospace")
+                )
+                page.update()
             finally:
                 run_button.disabled = False
                 progress_ring.visible = False
@@ -225,13 +237,16 @@ def build_app(page: ft.Page):
             return
         filename = f"{cfg.name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
         out_path = OUTPUT_DIR / filename
+        logger.info("帳票出力を開始します: %s（%d件）", filename, len(rows))
         try:
             export_report(cfg, rows, out_path)
+            logger.info("帳票出力が完了しました: %s", filename)
             status_text.value = "帳票を出力しました。下のリンクからダウンロードしてください。"
             export_link.controls = [
                 ft.TextButton(f"↓ {filename} をダウンロード", url=f"/output/{filename}")
             ]
         except Exception as ex:
+            logger.exception("export_report() failed")
             status_text.value = f"帳票出力エラー: {ex}"
         page.update()
 
