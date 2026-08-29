@@ -2,6 +2,5 @@
   "name": "サンプル(書籍情報を探す)",
   "search_keyword": "books.toscrape.com",
   "extract_keywords": ["£", "In stock"],
-  "max_pages": 3,
   "max_snippet_chars": 400
 }

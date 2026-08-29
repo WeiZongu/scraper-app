@@ -19,7 +19,6 @@ class SearchConfig:
     name: str
     search_keyword: str                        # Web検索にかけるキーワード
     extract_keywords: list[str] = field(default_factory=list)  # ページ内で探すキーワード
-    max_pages: int = 5                          # 検索結果から何件のページを開くか
     max_snippet_chars: int = 400                # 抜粋テキストの最大文字数
 
     def to_dict(self) -> dict:
@@ -31,7 +30,6 @@ class SearchConfig:
             name=d["name"],
             search_keyword=d.get("search_keyword", ""),
             extract_keywords=list(d.get("extract_keywords", [])),
-            max_pages=d.get("max_pages", 5),
             max_snippet_chars=d.get("max_snippet_chars", 400),
         )
 

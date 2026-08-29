@@ -31,6 +31,12 @@ SEARCH_URL_TEMPLATES = [
     "https://lite.duckduckgo.com/lite/?q={query}",
 ]
 
+# html.duckduckgo.com は "&s=<開始位置>" を30件区切りで進めることで次ページを取得できる。
+# ページ数の上限はユーザーには設けず「無限」に近づけるが、検索結果が本当に尽きた後まで
+# 永遠にループし続けないよう、暴走防止の安全上限としてのみ使う。
+SEARCH_PAGE_SIZE = 30
+SEARCH_OFFSET_SAFETY_LIMIT = 3000  # 100ページ相当
+
 # ページ内でキーワード一致を探す際の、抜粋として妥当とみなすテキスト長の範囲
 MIN_SNIPPET_CHARS = 8
 
@@ -55,37 +61,75 @@ def _extract_result_links(page: Page) -> list[str]:
     return [h for h in hrefs if h and "duckduckgo.com" not in h]
 
 
-def _search_result_urls(page: Page, keyword: str, max_results: int, on_progress: ProgressCallback) -> list[str]:
-    """検索結果ページから、上位 max_results 件のURLを取得する。"""
+def _search_result_urls(page: Page, keyword: str, on_progress: ProgressCallback) -> list[str]:
+    """検索結果ページから、見つかる限りのURLを取得する（件数上限なし）。"""
     on_progress(f"検索中: {keyword}")
     urls: list[str] = []
+    seen = set()
 
-    for template in SEARCH_URL_TEMPLATES:
-        url = template.format(query=quote_plus(keyword))
+    # 1つ目の検索先（html.duckduckgo.com）は "&s=<開始位置>" で次ページに進めるため、
+    # 新規URLが見つからなくなるまでページをめくり続ける。
+    base_template = SEARCH_URL_TEMPLATES[0]
+    offset = 0
+    empty_streak = 0
+    while empty_streak < 2 and offset < SEARCH_OFFSET_SAFETY_LIMIT:
+        url = f"{base_template.format(query=quote_plus(keyword))}&s={offset}"
         try:
             page.goto(url, timeout=30000)
-            page.wait_for_timeout(1000)
+            page.wait_for_timeout(800)
         except Exception as e:
             on_progress(f"  -> 検索ページの取得に失敗しました: {e}")
-            continue
-
-        hrefs = _extract_result_links(page)
-        for href in hrefs:
-            if href and href not in urls:
-                urls.append(href)
-            if len(urls) >= max_results:
-                break
-
-        if urls:
             break
 
+        hrefs = _extract_result_links(page)
+        new_count = 0
+        for href in hrefs:
+            if href and href not in seen:
+                seen.add(href)
+                urls.append(href)
+                new_count += 1
+
+        if new_count == 0:
+            empty_streak += 1
+        else:
+            empty_streak = 0
+            on_progress(f"  -> ここまでで {len(urls)} 件のページを発見。続きを確認します…")
+
+        offset += SEARCH_PAGE_SIZE
+
+    if not urls:
         try:
             page_title = page.title()
         except Exception:
             page_title = ""
-        on_progress(f"  -> {template.split('/')[2]} で0件でした（ページタイトル: 「{page_title}」）。")
+        on_progress(f"  -> html.duckduckgo.com で0件でした（ページタイトル: 「{page_title}」）。")
 
-    on_progress(f"  -> 検索結果 {len(urls)} 件を対象にします。")
+        # フォールバック: lite版など、その他の検索先を試す（ページングはしない）
+        for template in SEARCH_URL_TEMPLATES[1:]:
+            url = template.format(query=quote_plus(keyword))
+            try:
+                page.goto(url, timeout=30000)
+                page.wait_for_timeout(800)
+            except Exception as e:
+                on_progress(f"  -> 検索ページの取得に失敗しました: {e}")
+                continue
+
+            hrefs = _extract_result_links(page)
+            for href in hrefs:
+                if href and href not in seen:
+                    seen.add(href)
+                    urls.append(href)
+
+            if urls:
+                break
+
+            try:
+                page_title = page.title()
+            except Exception:
+                page_title = ""
+            on_progress(f"  -> {template.split('/')[2]} でも0件でした（ページタイトル: 「{page_title}」）。")
+
+    on_progress(f"  -> 検索結果 合計 {len(urls)} 件を対象にします。")
     return urls
 
 
@@ -163,7 +207,7 @@ def scrape(
         page = context.new_page()
 
         try:
-            urls = _search_result_urls(page, cfg.search_keyword, cfg.max_pages, on_progress)
+            urls = _search_result_urls(page, cfg.search_keyword, on_progress)
             if not urls:
                 on_progress("検索結果が見つかりませんでした。")
 

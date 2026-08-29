@@ -122,14 +122,11 @@ def build_app(page: ft.Page):
         expand=True,
         hint_text="例: 営業時間, 定休日, 住所",
     )
-    max_pages_field = ft.TextField(label="検索結果から開くページ数", expand=True, value="5")
-
     def load_into_form(cfg: SearchConfig):
         state["current_config_name"] = cfg.name
         name_field.value = cfg.name
         search_keyword_field.value = cfg.search_keyword
         extract_keywords_field.value = ", ".join(cfg.extract_keywords)
-        max_pages_field.value = str(cfg.max_pages)
         tabs.selected_index = 1  # 「検索設定」タブへ切り替え
         page.update()
 
@@ -138,7 +135,6 @@ def build_app(page: ft.Page):
         name_field.value = ""
         search_keyword_field.value = ""
         extract_keywords_field.value = ""
-        max_pages_field.value = "5"
         page.update()
 
     def build_config_from_form() -> SearchConfig:
@@ -147,7 +143,6 @@ def build_app(page: ft.Page):
             name=name_field.value.strip(),
             search_keyword=search_keyword_field.value.strip(),
             extract_keywords=extract_keywords,
-            max_pages=int(max_pages_field.value or 5),
         )
 
     def on_save(e):
@@ -263,7 +258,6 @@ def build_app(page: ft.Page):
         ft.ResponsiveRow([ft.Container(name_field, col=12)]),
         ft.ResponsiveRow([ft.Container(search_keyword_field, col=12)]),
         ft.ResponsiveRow([ft.Container(extract_keywords_field, col=12)]),
-        ft.ResponsiveRow([ft.Container(max_pages_field, col={"xs": 12, "sm": 6, "md": 3})]),
         ft.ElevatedButton("設定を保存", icon=ft.Icons.SAVE, on_click=on_save),
     ], expand=True, scroll=ft.ScrollMode.AUTO)
 
