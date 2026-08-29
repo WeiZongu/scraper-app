@@ -25,11 +25,19 @@ DESKTOP_USER_AGENT = (
 )
 
 # 検索先候補。1つ目がブロックされたり0件だったりした場合、
-# 順番に次の候補を試す（DuckDuckGoはHTML構造が変わることがあるため）。
+# 順番に次の候補を試す（DuckDuckGoはHTML構造が変わったり、ホスティング元の
+# IPアドレスがブロックされたりすることがあるため、別ドメインのBingも用意する）。
 SEARCH_URL_TEMPLATES = [
     "https://html.duckduckgo.com/html/?q={query}",
     "https://lite.duckduckgo.com/lite/?q={query}",
+    "https://www.bing.com/search?q={query}",
 ]
+# 上記の検索先自身のドメイン（結果リンクの抽出時に誤って拾わないよう除外する）
+SEARCH_ENGINE_OWN_DOMAINS = ("duckduckgo.com", "bing.com", "microsoft.com")
+
+# 検索ページの読み込みタイムアウト。ブロックされている場合は待っても無駄なため、
+# 通常のページ取得より短めにして、早めに次の候補へフォールバックできるようにする。
+SEARCH_GOTO_TIMEOUT_MS = 15000
 
 # html.duckduckgo.com は "&s=<開始位置>" を30件区切りで進めることで次ページを取得できる。
 # ページ数の上限はユーザーには設けず「無限」に近づけるが、検索結果が本当に尽きた後まで
@@ -55,10 +63,10 @@ def _extract_result_links(page: Page) -> list[str]:
     hrefs = page.eval_on_selector_all("a.result__a", "els => els.map(e => e.href)")
     if hrefs:
         return hrefs
-    # 上記で取れない場合（lite版や構造変更時）は、外部への通常リンクを広めに拾い、
+    # 上記で取れない場合（lite版・Bing・構造変更時）は、外部への通常リンクを広めに拾い、
     # 検索エンジン自身へのリンク・トラッキングリンクを除外する。
     hrefs = page.eval_on_selector_all("a[href^='http']", "els => els.map(e => e.href)")
-    return [h for h in hrefs if h and "duckduckgo.com" not in h]
+    return [h for h in hrefs if h and not any(domain in h for domain in SEARCH_ENGINE_OWN_DOMAINS)]
 
 
 def _search_result_urls(page: Page, keyword: str, on_progress: ProgressCallback) -> list[str]:
@@ -75,7 +83,7 @@ def _search_result_urls(page: Page, keyword: str, on_progress: ProgressCallback)
     while empty_streak < 2 and offset < SEARCH_OFFSET_SAFETY_LIMIT:
         url = f"{base_template.format(query=quote_plus(keyword))}&s={offset}"
         try:
-            page.goto(url, timeout=30000)
+            page.goto(url, timeout=SEARCH_GOTO_TIMEOUT_MS, wait_until="domcontentloaded")
             page.wait_for_timeout(800)
         except Exception as e:
             on_progress(f"  -> 検索ページの取得に失敗しました: {e}")
@@ -108,7 +116,7 @@ def _search_result_urls(page: Page, keyword: str, on_progress: ProgressCallback)
         for template in SEARCH_URL_TEMPLATES[1:]:
             url = template.format(query=quote_plus(keyword))
             try:
-                page.goto(url, timeout=30000)
+                page.goto(url, timeout=SEARCH_GOTO_TIMEOUT_MS, wait_until="domcontentloaded")
                 page.wait_for_timeout(800)
             except Exception as e:
                 on_progress(f"  -> 検索ページの取得に失敗しました: {e}")
@@ -240,7 +248,7 @@ def scrape(
             for i, url in enumerate(urls, start=1):
                 on_progress(f"[{i}/{len(urls)}] ページを取得中: {url}")
                 try:
-                    page.goto(url, timeout=20000)
+                    page.goto(url, timeout=20000, wait_until="domcontentloaded")
                     page.wait_for_timeout(500)
                 except Exception as e:
                     on_progress(f"  -> 取得失敗: {e}")
