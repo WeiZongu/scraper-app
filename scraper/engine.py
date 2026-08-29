@@ -3,10 +3,10 @@
 テキストの塊を丸ごと抜き出すエンジン。
 CSSセレクタの指定なしで使えるように、要素の特定はキーワード一致で行う。
 
-Web検索には Tavily Search API を使う（検索エンジンのHTMLページを直接
+Web検索には Serper.dev の Search API を使う（検索エンジンのHTMLページを直接
 スクレイピングする方式は、bot検知やHTML構造の変化・クラウドIPのブロックなどで
 繰り返し不安定になったため、正式なAPIに切り替えた。クレジットカード登録不要の
-無料枠があるためTavilyを採用している）。
+無料クレジットがあるためSerper.devを採用している）。
 """
 from __future__ import annotations
 
@@ -30,9 +30,11 @@ DESKTOP_USER_AGENT = (
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
 
-TAVILY_SEARCH_API_URL = "https://api.tavily.com/search"
-# Tavily Search APIの1回の検索で返せる最大件数（APIの仕様上の上限で、ページングはできない）
-TAVILY_MAX_RESULTS = 20
+SERPER_SEARCH_API_URL = "https://google.serper.dev/search"
+# 1ページあたりの件数と、暴走防止のための取得ページ数の安全上限
+# （買い切りクレジット制のため、無制限に使い切らないよう控えめにしておく）
+SERPER_RESULTS_PER_PAGE = 10
+SERPER_MAX_PAGES = 5
 
 # ページ内でキーワード一致を探す際の、抜粋として妥当とみなすテキスト長の範囲
 MIN_SNIPPET_CHARS = 8
@@ -46,53 +48,66 @@ def _noop(_msg: str) -> None:
     pass
 
 
-def _tavily_search_urls(keyword: str, on_progress: ProgressCallback) -> list[str]:
-    """Tavily Search APIで検索し、URLを取得する（1回の検索で最大 TAVILY_MAX_RESULTS 件）。"""
-    api_key = os.environ.get("TAVILY_API_KEY", "").strip()
+def _serper_search_urls(keyword: str, on_progress: ProgressCallback) -> list[str]:
+    """Serper.dev の Search API で検索し、URLを取得する。"""
+    api_key = os.environ.get("SERPER_API_KEY", "").strip()
     if not api_key:
         raise ScrapeError(
-            "TAVILY_API_KEY が設定されていません。"
-            "Tavily (https://www.tavily.com/) の無料枠に登録し、"
-            "取得したAPIキーを環境変数 TAVILY_API_KEY に設定してください。"
+            "SERPER_API_KEY が設定されていません。"
+            "Serper.dev (https://serper.dev/) に登録し、"
+            "取得したAPIキーを環境変数 SERPER_API_KEY に設定してください。"
         )
 
     on_progress(f"検索中: {keyword}")
-    try:
-        resp = requests.post(
-            TAVILY_SEARCH_API_URL,
-            json={"query": keyword, "max_results": TAVILY_MAX_RESULTS},
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
-            timeout=30,
-        )
-    except requests.RequestException as e:
-        on_progress(f"  -> 検索APIへの接続に失敗しました: {e}")
-        return []
-
-    if resp.status_code == 401:
-        raise ScrapeError("Tavily APIキーが無効です。設定したAPIキーを確認してください。")
-    if resp.status_code == 429:
-        on_progress("  -> Tavily APIのレート制限/無料枠上限に達しました。")
-        return []
-    if resp.status_code != 200:
-        on_progress(f"  -> 検索APIエラー（status={resp.status_code}）: {resp.text[:200]}")
-        return []
-
-    try:
-        data = resp.json()
-    except ValueError:
-        on_progress("  -> 検索APIの応答を解析できませんでした。")
-        return []
-
     urls: list[str] = []
     seen = set()
-    for r in data.get("results") or []:
-        url = r.get("url")
-        if url and url not in seen:
-            seen.add(url)
-            urls.append(url)
+
+    for page_num in range(1, SERPER_MAX_PAGES + 1):
+        try:
+            resp = requests.post(
+                SERPER_SEARCH_API_URL,
+                json={"q": keyword, "num": SERPER_RESULTS_PER_PAGE, "page": page_num},
+                headers={
+                    "X-API-KEY": api_key,
+                    "Content-Type": "application/json",
+                },
+                timeout=30,
+            )
+        except requests.RequestException as e:
+            on_progress(f"  -> 検索APIへの接続に失敗しました: {e}")
+            break
+
+        if resp.status_code == 401 or resp.status_code == 403:
+            raise ScrapeError("Serper APIキーが無効です。設定したAPIキーを確認してください。")
+        if resp.status_code == 429:
+            on_progress("  -> Serper APIのレート制限/無料クレジット上限に達しました。ここまでの結果で続行します。")
+            break
+        if resp.status_code != 200:
+            on_progress(f"  -> 検索APIエラー（status={resp.status_code}）: {resp.text[:200]}")
+            break
+
+        try:
+            data = resp.json()
+        except ValueError:
+            on_progress("  -> 検索APIの応答を解析できませんでした。")
+            break
+
+        organic = data.get("organic") or []
+        if not organic:
+            break
+
+        new_count = 0
+        for r in organic:
+            url = r.get("link")
+            if url and url not in seen:
+                seen.add(url)
+                urls.append(url)
+                new_count += 1
+
+        if new_count == 0:
+            break
+
+        on_progress(f"  -> ここまでで {len(urls)} 件のページを発見。続きを確認します…")
 
     on_progress(f"  -> 検索結果 {len(urls)} 件を対象にします。")
     return urls
@@ -191,7 +206,7 @@ def scrape(
 
     # 検索はAPI呼び出しのみでブラウザ不要なため、Playwright起動前に済ませる
     # （APIキー未設定などで早期に失敗する場合、ブラウザを起動する無駄を避けられる）。
-    urls = _tavily_search_urls(cfg.search_keyword, on_progress)
+    urls = _serper_search_urls(cfg.search_keyword, on_progress)
     if not urls:
         on_progress("検索結果が見つかりませんでした。")
 
