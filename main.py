@@ -27,8 +27,8 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 APP_PASSWORD = os.environ.get("APP_PASSWORD", "")  # 空文字なら認証なし
 
-PREVIEW_COLUMNS = ["keyword", "text", "title", "url", "fetched_at"]
-PREVIEW_LABELS = ["キーワード", "抜粋テキスト", "ページタイトル", "URL", "取得日時"]
+PREVIEW_COLUMNS = ["keyword", "text", "image_url", "video_url", "title", "url", "fetched_at"]
+PREVIEW_LABELS = ["キーワード", "抜粋テキスト", "画像URL", "動画URL", "ページタイトル", "URL", "取得日時"]
 
 
 def build_app(page: ft.Page):

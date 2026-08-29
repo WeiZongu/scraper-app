@@ -170,7 +170,33 @@ _EXTRACT_JS = """
             const dedupeKey = kw + "::" + snippet.slice(0, 80);
             if (seen.has(dedupeKey)) continue;
             seen.add(dedupeKey);
-            results.push({keyword: kw, text: snippet});
+
+            // マッチしたテキストの塊の中、またはそのすぐ近く（数階層上の親要素まで）に
+            // ある画像・動画だけを「関連メディア」として拾う。画像・商品写真は同じ
+            // カード/記事コンテナ内で見出しやテキストの「兄弟要素」になっていることが
+            // 多いため、el自身だけでなく少し上の階層まで確認する。ページ全体は見ない。
+            let imageUrl = "";
+            let videoUrl = "";
+            let container = el;
+            for (let hops = 0; hops < 3 && container; hops++) {
+                const img = container.querySelector("img[src]");
+                const video = container.querySelector("video");
+                if (img || video) {
+                    if (img) imageUrl = img.src;
+                    if (video) {
+                        videoUrl = video.currentSrc || "";
+                        if (!videoUrl) {
+                            const source = video.querySelector("source[src]");
+                            if (source) videoUrl = source.src;
+                        }
+                        if (!imageUrl && video.poster) imageUrl = video.poster;
+                    }
+                    break;
+                }
+                container = container.parentElement;
+            }
+
+            results.push({keyword: kw, text: snippet, imageUrl: imageUrl, videoUrl: videoUrl});
         }
     }
     return results;
@@ -241,6 +267,8 @@ def scrape(
                     results.append({
                         "keyword": m["keyword"],
                         "text": m["text"],
+                        "image_url": m.get("imageUrl", ""),
+                        "video_url": m.get("videoUrl", ""),
                         "title": title,
                         "url": url,
                         "fetched_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
