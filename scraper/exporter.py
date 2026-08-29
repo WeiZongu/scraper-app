@@ -1,7 +1,9 @@
 """
 検索・抽出結果を、写真を活かしたリッチなPowerPointスライドとして出力する。
 構成: 表紙スライド → 全体サマリースライド → 結果スライド（1件1枚、
-画像を背景いっぱいに敷き、タイトルと抜粋テキストを中央に配置するカード風レイアウト）。
+そのキーワードに紐づく画像をスケルトン風（輪郭線だけを抽出し、元画像の
+色に合わせて着色したもの）の背景として敷き、タイトルと抜粋テキストを
+中央に配置するカード風レイアウト）。
 """
 from __future__ import annotations
 
@@ -11,6 +13,7 @@ from datetime import datetime
 from io import BytesIO
 from pathlib import Path
 
+from PIL import Image, ImageFilter, ImageOps
 from pptx import Presentation
 from pptx.dml.color import RGBColor
 from pptx.enum.shapes import MSO_SHAPE
@@ -33,6 +36,7 @@ LINK_COLOR = RGBColor(0x9E, 0xC4, 0xFF)
 WHITE = RGBColor(0xFF, 0xFF, 0xFF)
 
 OVERLAY_ALPHA_WITH_IMAGE = 55  # 画像がある場合のオーバーレイの不透明度(%)
+SKELETON_SCRIM_ALPHA = 30  # スケルトン画像の上にかける、文字を読みやすくするための暗さ(%)
 DOWNLOAD_TIMEOUT_SEC = 8
 
 
@@ -65,12 +69,73 @@ def _download_image_bytes(url: str) -> BytesIO | None:
         return None
 
 
-def _add_cover_background_image(slide, image_stream: BytesIO) -> bool:
-    """画像をスライド全体を覆うように拡大配置する（はみ出た部分はスライド外に
-    出るため、PowerPoint上では自動的に切り取られて表示される）。失敗したら False。
+def _load_image(url: str) -> Image.Image | None:
+    """画像URL（そのキーワードの抽出結果に紐づく画像）をダウンロードし、
+    Pillowで扱える画像として読み込む。失敗した場合は None を返す。
+    """
+    stream = _download_image_bytes(url)
+    if stream is None:
+        return None
+    try:
+        img = Image.open(stream)
+        img.load()
+        return img.convert("RGB")
+    except Exception:
+        return None
+
+
+def _average_color(image: Image.Image) -> tuple[int, int, int]:
+    """画像を1pxに縮小し、全体の平均色を取得する（「カラーは画像に合わせる」
+    ための、背景・線の色のベースとして使う）。
+    """
+    small = image.resize((1, 1), Image.Resampling.LANCZOS)
+    return small.getpixel((0, 0))
+
+
+def _scale_color(rgb: tuple[int, int, int], factor: float) -> tuple[int, int, int]:
+    return tuple(min(255, max(0, int(c * factor))) for c in rgb)
+
+
+def _blend_color(
+    rgb: tuple[int, int, int], other: tuple[int, int, int], t: float
+) -> tuple[int, int, int]:
+    return tuple(int(c * (1 - t) + o * t) for c, o in zip(rgb, other))
+
+
+def _make_skeleton_overlay(image: Image.Image, line_color: tuple[int, int, int]) -> Image.Image:
+    """写真から輪郭線だけを抽出し、指定色で着色した透過PNG(RGBA)を作る
+    （「背景はスケルトン風のキーワード関連画像が良い」というリクエストへの対応）。
+    グレースケール化した画像に輪郭強調フィルタ(CONTOUR)をかけて輪郭線を
+    抽出し、線の濃さをそのまま透明度に変換することで、線の部分だけ
+    不透明に色が乗った、輪郭線だけの画像（スケルトン）を作る。
+    """
+    gray = ImageOps.grayscale(image)
+    blur_radius = max(1, min(gray.size) // 150)
+    if blur_radius > 1:
+        gray = gray.filter(ImageFilter.GaussianBlur(blur_radius))
+    contour = gray.filter(ImageFilter.CONTOUR)
+
+    # CONTOURの出力は白地(255)に輪郭が暗い線として乗るので、暗いほど
+    # 不透明になるよう反転してから透明度として使う（コントラストも強調する）。
+    alpha = ImageOps.invert(contour)
+    alpha = ImageOps.autocontrast(alpha)
+    alpha = alpha.point(lambda v: min(255, int(v * 1.6)))
+
+    overlay = Image.new("RGBA", contour.size, line_color + (0,))
+    overlay.putalpha(alpha)
+    return overlay
+
+
+def _add_cover_picture(slide, pil_image: Image.Image) -> bool:
+    """画像（PIL Image、透過PNGも可）をスライド全体を覆うように拡大配置する
+    （はみ出た部分はスライド外に出るため、PowerPoint上では自動的に切り取られて
+    表示される）。失敗したら False。
     """
     try:
-        pic = slide.shapes.add_picture(image_stream, 0, 0)
+        buf = BytesIO()
+        pil_image.save(buf, format="PNG")
+        buf.seek(0)
+        pic = slide.shapes.add_picture(buf, 0, 0)
         scale = max(SLIDE_WIDTH / pic.width, SLIDE_HEIGHT / pic.height)
         new_w = int(pic.width * scale)
         new_h = int(pic.height * scale)
@@ -83,16 +148,22 @@ def _add_cover_background_image(slide, image_stream: BytesIO) -> bool:
         return False
 
 
+def _add_solid_rect(slide, rgb: RGBColor, alpha_pct: int | None = None):
+    shape = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, 0, 0, SLIDE_WIDTH, SLIDE_HEIGHT)
+    shape.line.fill.background()
+    shape.shadow.inherit = False
+    shape.fill.solid()
+    shape.fill.fore_color.rgb = rgb
+    if alpha_pct is not None:
+        _set_transparency(shape.fill, alpha_pct)
+    return shape
+
+
 def _add_overlay(slide, has_image: bool) -> None:
-    overlay = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, 0, 0, SLIDE_WIDTH, SLIDE_HEIGHT)
-    overlay.line.fill.background()
-    overlay.shadow.inherit = False
-    overlay.fill.solid()
     if has_image:
-        overlay.fill.fore_color.rgb = OVERLAY_COLOR
-        _set_transparency(overlay.fill, OVERLAY_ALPHA_WITH_IMAGE)
+        _add_solid_rect(slide, OVERLAY_COLOR, OVERLAY_ALPHA_WITH_IMAGE)
     else:
-        overlay.fill.fore_color.rgb = ACCENT_COLOR
+        _add_solid_rect(slide, ACCENT_COLOR)
 
 
 def _add_title_slide(prs: Presentation, cfg: SearchConfig, count: int) -> None:
@@ -181,15 +252,33 @@ def _add_summary_slide(prs: Presentation, rows: list[dict]) -> None:
 
 
 def _add_result_slide(prs: Presentation, row: dict, index: int, total: int) -> None:
-    """1件を1枚のカード風スライドにする。画像があれば背景いっぱいに敷き、
-    半透明の暗いオーバーレイの上にタイトルと抜粋テキストを中央揃えで配置する
-    （画像が無い場合はアクセントカラーの単色背景になる）。
+    """1件を1枚のカード風スライドにする。そのキーワードに紐づく画像があれば、
+    輪郭線だけを抽出し元画像の色に合わせて着色した「スケルトン風」の背景として
+    敷き、その上にタイトルと抜粋テキストを中央揃えで配置する
+    （画像が無い/読み込めない場合はアクセントカラーの単色背景になる）。
     """
     slide = prs.slides.add_slide(prs.slide_layouts[6])
 
-    image_stream = _download_image_bytes(row.get("image_url", ""))
-    has_image = image_stream is not None and _add_cover_background_image(slide, image_stream)
-    _add_overlay(slide, has_image)
+    pil_image = _load_image(row.get("image_url", ""))
+    if pil_image is not None:
+        avg_color = _average_color(pil_image)
+        canvas_color = RGBColor(*_scale_color(avg_color, 0.32))
+        line_color = _blend_color(avg_color, (255, 255, 255), 0.6)
+    else:
+        canvas_color = ACCENT_COLOR
+        line_color = None
+    _add_solid_rect(slide, canvas_color)
+
+    has_image = False
+    if pil_image is not None:
+        try:
+            skeleton = _make_skeleton_overlay(pil_image, line_color)
+            has_image = _add_cover_picture(slide, skeleton)
+        except Exception:
+            has_image = False
+
+    if has_image:
+        _add_solid_rect(slide, OVERLAY_COLOR, SKELETON_SCRIM_ALPHA)
 
     title_box = slide.shapes.add_textbox(Inches(1), Inches(0.6), SLIDE_WIDTH - Inches(2), Inches(1.1))
     tf = title_box.text_frame

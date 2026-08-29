@@ -11,7 +11,9 @@ Web検索には Serper.dev の Search API を使う（検索エンジンのHTML�
 from __future__ import annotations
 
 import os
+import re
 from datetime import datetime
+from statistics import median
 from typing import Callable
 
 import requests
@@ -225,6 +227,84 @@ def _extract_matches(page: Page, keywords: list[str], max_snippet_chars: int) ->
     )
 
 
+# 数値だけ微妙に異なる重複情報（例:「営業時間 11:00〜21:00」と「営業時間 11:00〜22:00」）を
+# 1件にまとめ、代表値として数値部分の中央値を採用するための処理。
+_NUMBER_RE = re.compile(r"\d+(?:[:.,]\d+)*")
+
+
+def _normalize_digits(text: str) -> str:
+    """数値部分を "#" に置き換えた文字列を返す。これが一致する行同士だけを
+    「数値だけ違う重複」とみなしてグルーピングする（無関係な情報を誤って
+    まとめてしまわないようにするため）。"""
+    return _NUMBER_RE.sub("#", text)
+
+
+def _median_numeric_string(raw_values: list[str]) -> str:
+    """"11:30" のような時刻表記と、通常の数値表記の両方に対応した中央値を返す。"""
+    if all(re.fullmatch(r"\d{1,2}:\d{2}", v) for v in raw_values):
+        minutes = []
+        for v in raw_values:
+            h, m = v.split(":")
+            minutes.append(int(h) * 60 + int(m))
+        med = int(round(median(minutes)))
+        return f"{med // 60:02d}:{med % 60:02d}"
+
+    try:
+        numbers = [float(v.replace(",", "")) for v in raw_values]
+        med = median(numbers)
+        return str(int(med)) if med == int(med) else str(med)
+    except ValueError:
+        pass
+
+    sorted_values = sorted(raw_values)
+    return sorted_values[len(sorted_values) // 2]
+
+
+def _consolidate_near_duplicates(rows: list[dict], on_progress: ProgressCallback) -> list[dict]:
+    """同じキーワードで、数値部分だけが微妙に異なる行（別ページに載っている
+    同じ情報の表記ゆれ等）を1件にまとめ、数値部分は中央値に置き換える。
+    数値以外の部分が異なる場合は別の情報とみなし、まとめない。"""
+    groups: dict[tuple[str, str], list[dict]] = {}
+    order: list[tuple[str, str]] = []
+    for row in rows:
+        key = (row["keyword"], _normalize_digits(row["text"]))
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(row)
+
+    consolidated: list[dict] = []
+    merged_count = 0
+    for key in order:
+        group = groups[key]
+        if len(group) == 1:
+            consolidated.append(group[0])
+            continue
+
+        number_lists = [_NUMBER_RE.findall(r["text"]) for r in group]
+        n_numbers = len(number_lists[0])
+        if n_numbers == 0 or any(len(nl) != n_numbers for nl in number_lists):
+            # 数値の個数が揃わない場合はまとめ方が判断できないため、そのまま残す
+            consolidated.extend(group)
+            continue
+
+        medians = [_median_numeric_string([nl[i] for nl in number_lists]) for i in range(n_numbers)]
+        template = group[0]["text"]
+        parts = _NUMBER_RE.split(template)
+        rebuilt = parts[0]
+        for part, med in zip(parts[1:], medians):
+            rebuilt += med + part
+
+        merged_row = dict(group[0])
+        merged_row["text"] = rebuilt
+        consolidated.append(merged_row)
+        merged_count += len(group) - 1
+
+    if merged_count:
+        on_progress(f"  -> 数値だけ異なる重複 {merged_count} 件を中央値でまとめました。")
+    return consolidated
+
+
 def scrape(
     cfg: SearchConfig,
     on_progress: ProgressCallback = _noop,
@@ -297,6 +377,8 @@ def scrape(
 
         finally:
             browser.close()
+
+    results = _consolidate_near_duplicates(results, on_progress)
 
     on_progress(f"完了: 合計 {len(results)} 件取得しました。")
     return results
