@@ -16,7 +16,20 @@ from .config import SearchConfig
 # 進捗通知用コールバックの型: (message: str) -> None
 ProgressCallback = Callable[[str], None]
 
-SEARCH_URL = "https://html.duckduckgo.com/html/?q={query}"
+# ヘッドレスブラウザだと分かるUser-Agent（"HeadlessChrome"表記）だと
+# 検索エンジン側にブロックされやすいため、通常のデスクトップ版と同じ
+# User-Agentを明示的に指定する。
+DESKTOP_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
+
+# 検索先候補。1つ目がブロックされたり0件だったりした場合、
+# 順番に次の候補を試す（DuckDuckGoはHTML構造が変わることがあるため）。
+SEARCH_URL_TEMPLATES = [
+    "https://html.duckduckgo.com/html/?q={query}",
+    "https://lite.duckduckgo.com/lite/?q={query}",
+]
 
 # ページ内でキーワード一致を探す際の、抜粋として妥当とみなすテキスト長の範囲
 MIN_SNIPPET_CHARS = 8
@@ -30,26 +43,48 @@ def _noop(_msg: str) -> None:
     pass
 
 
-def _search_result_urls(page: Page, keyword: str, max_results: int, on_progress: ProgressCallback) -> list[str]:
-    """DuckDuckGoの検索結果ページから、上位 max_results 件のURLを取得する。"""
-    url = SEARCH_URL.format(query=quote_plus(keyword))
-    on_progress(f"検索中: {keyword}")
-    page.goto(url, timeout=30000)
-    try:
-        page.wait_for_selector("a.result__a", timeout=10000)
-    except Exception:
-        pass
+def _extract_result_links(page: Page) -> list[str]:
+    """検索結果ページから、外部サイトへのリンクを取り出す。"""
+    # html.duckduckgo.com の結果リンクに使われるクラス名（変更される可能性あり）
+    hrefs = page.eval_on_selector_all("a.result__a", "els => els.map(e => e.href)")
+    if hrefs:
+        return hrefs
+    # 上記で取れない場合（lite版や構造変更時）は、外部への通常リンクを広めに拾い、
+    # 検索エンジン自身へのリンク・トラッキングリンクを除外する。
+    hrefs = page.eval_on_selector_all("a[href^='http']", "els => els.map(e => e.href)")
+    return [h for h in hrefs if h and "duckduckgo.com" not in h]
 
-    hrefs = page.eval_on_selector_all(
-        "a.result__a",
-        "els => els.map(e => e.href)",
-    )
+
+def _search_result_urls(page: Page, keyword: str, max_results: int, on_progress: ProgressCallback) -> list[str]:
+    """検索結果ページから、上位 max_results 件のURLを取得する。"""
+    on_progress(f"検索中: {keyword}")
     urls: list[str] = []
-    for href in hrefs:
-        if href and href not in urls:
-            urls.append(href)
-        if len(urls) >= max_results:
+
+    for template in SEARCH_URL_TEMPLATES:
+        url = template.format(query=quote_plus(keyword))
+        try:
+            page.goto(url, timeout=30000)
+            page.wait_for_timeout(1000)
+        except Exception as e:
+            on_progress(f"  -> 検索ページの取得に失敗しました: {e}")
+            continue
+
+        hrefs = _extract_result_links(page)
+        for href in hrefs:
+            if href and href not in urls:
+                urls.append(href)
+            if len(urls) >= max_results:
+                break
+
+        if urls:
             break
+
+        try:
+            page_title = page.title()
+        except Exception:
+            page_title = ""
+        on_progress(f"  -> {template.split('/')[2]} で0件でした（ページタイトル: 「{page_title}」）。")
+
     on_progress(f"  -> 検索結果 {len(urls)} 件を対象にします。")
     return urls
 
@@ -124,7 +159,8 @@ def scrape(
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=headless)
-        page = browser.new_page()
+        context = browser.new_context(user_agent=DESKTOP_USER_AGENT, locale="ja-JP")
+        page = context.new_page()
 
         try:
             urls = _search_result_urls(page, cfg.search_keyword, cfg.max_pages, on_progress)
