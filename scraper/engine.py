@@ -328,73 +328,93 @@ def scrape(
     seen_texts: set[str] = set()
 
     with sync_playwright() as p:
-        # 無料サーバー(メモリ512MB程度)でもOOMで落ちないよう、コンテナ向けの
-        # 省メモリオプションを付けてChromiumを起動する。
-        browser = p.chromium.launch(
-            headless=headless,
-            args=["--disable-dev-shm-usage", "--disable-gpu", "--no-zygote"],
-        )
-        context = browser.new_context(user_agent=DESKTOP_USER_AGENT, locale="ja-JP")
-        # 画像・フォントはDOMのテキストやsrc属性の取得には不要
-        # （実際に画面へ描画するわけではないため）。読み込みをブロックすることで
-        # メモリ使用量と通信量を削減できる。
-        # ※CSS(stylesheet)は innerText が「画面に表示されている文字か」を
-        #   CSSの表示状態に基づいて判定するため、ブロックすると隠し要素まで
-        #   拾ってしまい抽出結果が変わる可能性があるため対象外にする。
-        # ※動画(media)は video.currentSrc の解決に読み込みが関わる場合があるため
-        #   同様に対象外にする（件数も画像ほど多くなく、影響は小さい）。
-        context.route(
-            "**/*",
-            lambda route: route.abort()
-            if route.request.resource_type in ("image", "font")
-            else route.continue_(),
-        )
-        page = context.new_page()
+        def launch():
+            # 無料サーバー(メモリ512MB程度)でもOOMで落ちないよう、コンテナ向けの
+            # 省メモリオプションを付けてChromiumを起動する。
+            b = p.chromium.launch(
+                headless=headless,
+                args=["--disable-dev-shm-usage", "--disable-gpu", "--no-zygote"],
+            )
+            c = b.new_context(user_agent=DESKTOP_USER_AGENT, locale="ja-JP")
+            # 画像・フォントはDOMのテキストやsrc属性の取得には不要
+            # （実際に画面へ描画するわけではないため）。読み込みをブロックすることで
+            # メモリ使用量と通信量を削減できる。
+            # ※CSS(stylesheet)は innerText が「画面に表示されている文字か」を
+            #   CSSの表示状態に基づいて判定するため、ブロックすると隠し要素まで
+            #   拾ってしまい抽出結果が変わる可能性があるため対象外にする。
+            # ※動画(media)は video.currentSrc の解決に読み込みが関わる場合があるため
+            #   同様に対象外にする（件数も画像ほど多くなく、影響は小さい）。
+            c.route(
+                "**/*",
+                lambda route: route.abort()
+                if route.request.resource_type in ("image", "font")
+                else route.continue_(),
+            )
+            return b, c
+
+        # Chromiumは長時間・大量ページを開き続けるとネイティブ側のメモリ使用量が
+        # 徐々に増えていく傾向があるため（OSにすぐ返却されない等）、一定件数ごとに
+        # ブラウザごと再起動してメモリを解放する。
+        BROWSER_RESTART_EVERY = 15
+        browser, context = launch()
 
         try:
             for i, url in enumerate(urls, start=1):
+                if i > 1 and (i - 1) % BROWSER_RESTART_EVERY == 0:
+                    on_progress("  -> メモリ解放のためブラウザを再起動します…")
+                    context.close()
+                    browser.close()
+                    browser, context = launch()
+
                 on_progress(f"[{i}/{len(urls)}] ページを取得中: {url}")
+                # ページ単位で使い切ったら閉じることで、そのページが保持していた
+                # メモリ（DOM・画像バッファ等）を都度解放する。
+                page = context.new_page()
                 try:
-                    page.goto(url, timeout=20000, wait_until="domcontentloaded")
-                    page.wait_for_timeout(500)
-                except Exception as e:
-                    on_progress(f"  -> 取得失敗: {e}")
-                    continue
-
-                title = ""
-                try:
-                    title = page.title()
-                except Exception:
-                    pass
-
-                try:
-                    matches = _extract_matches(page, keywords, cfg.max_snippet_chars)
-                except Exception as e:
-                    on_progress(f"  -> 抽出失敗: {e}")
-                    continue
-
-                added = 0
-                for m in matches:
-                    # サイト内の別ページに同じ文章（フッターの住所など）が
-                    # 繰り返し出てくることがあるため、テキスト内容だけで
-                    # サイト全体を通して重複排除する。
-                    dedupe_key = m["text"]
-                    if dedupe_key in seen_texts:
+                    try:
+                        page.goto(url, timeout=20000, wait_until="domcontentloaded")
+                        page.wait_for_timeout(500)
+                    except Exception as e:
+                        on_progress(f"  -> 取得失敗: {e}")
                         continue
-                    seen_texts.add(dedupe_key)
-                    results.append({
-                        "keyword": m["keyword"],
-                        "text": m["text"],
-                        "image_url": m.get("imageUrl", ""),
-                        "video_url": m.get("videoUrl", ""),
-                        "title": title,
-                        "url": url,
-                        "fetched_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    })
-                    added += 1
-                on_progress(f"  -> {added}件抽出（累計 {len(results)}件）")
+
+                    title = ""
+                    try:
+                        title = page.title()
+                    except Exception:
+                        pass
+
+                    try:
+                        matches = _extract_matches(page, keywords, cfg.max_snippet_chars)
+                    except Exception as e:
+                        on_progress(f"  -> 抽出失敗: {e}")
+                        continue
+
+                    added = 0
+                    for m in matches:
+                        # サイト内の別ページに同じ文章（フッターの住所など）が
+                        # 繰り返し出てくることがあるため、テキスト内容だけで
+                        # サイト全体を通して重複排除する。
+                        dedupe_key = m["text"]
+                        if dedupe_key in seen_texts:
+                            continue
+                        seen_texts.add(dedupe_key)
+                        results.append({
+                            "keyword": m["keyword"],
+                            "text": m["text"],
+                            "image_url": m.get("imageUrl", ""),
+                            "video_url": m.get("videoUrl", ""),
+                            "title": title,
+                            "url": url,
+                            "fetched_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        })
+                        added += 1
+                    on_progress(f"  -> {added}件抽出（累計 {len(results)}件）")
+                finally:
+                    page.close()
 
         finally:
+            context.close()
             browser.close()
 
     results = _consolidate_near_duplicates(results, on_progress)
