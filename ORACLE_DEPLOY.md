@@ -113,10 +113,14 @@ docker run -d \
   --name scraper-app \
   --restart unless-stopped \
   -p 8550:8550 \
+  -e BRAVE_SEARCH_API_KEY="Brave Search APIで取得したAPIキー" \
   -e APP_PASSWORD="お好きなパスワードに変更してください" \
   -v $(pwd)/site_configs:/app/site_configs \
   scraper-app
 ```
+
+`BRAVE_SEARCH_API_KEY` は README.md の「事前準備」の手順で取得してください
+（https://api-dashboard.search.brave.com/ ）。設定しないと検索機能が動作しません。
 
 - `--restart unless-stopped`: サーバー再起動時もアプリが自動起動します
 - `-v $(pwd)/site_configs:/app/site_configs`: サイト設定をサーバーのディスクに永続化

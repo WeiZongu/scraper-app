@@ -7,6 +7,17 @@ CSSセレクタの指定は不要です。**検索キーワード**でWebを検�
 
 JavaScriptで動的にコンテンツを描画するサイト（SPA等）にも対応するため、
 収集エンジンには [Playwright](https://playwright.dev/python/) を使用しています。
+Web検索には [Brave Search API](https://api-dashboard.search.brave.com/) を使用しています
+（検索エンジンのページを直接スクレイピングする方式は、bot検知やHTML構造の変化で
+不安定になりやすいため、正式なAPIを使う方式にしています）。
+
+## 事前準備: Brave Search APIキーの取得（無料枠あり）
+
+1. https://api-dashboard.search.brave.com/ にアクセスし、アカウントを作成してログイン
+2. 「Free AI」など無料枠のプランを選択してサブスクリプションを作成
+   （※サインアップ条件・無料枠の内容は変更される場合があるため、登録時の画面で最新の内容を確認してください）
+3. ダッシュボードでAPIキーを発行し、控えておく（`BSAxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx` のような文字列）
+4. このAPIキーを、後述の環境変数 `BRAVE_SEARCH_API_KEY` に設定します
 
 ## セットアップ
 
@@ -38,8 +49,10 @@ playwright install chromium   # 初回のみ。Chromiumブラウザ本体をダ�
 2. Renderにログイン →「New +」→「Web Service」→ 先ほどのリポジトリを選択
 3. **Environment** は「Docker」を選択（同梱の `Dockerfile` が自動で使われます）
 4. **Instance Type** は無料枠（Free）でOK
-5. 環境変数に `APP_PASSWORD` を設定することを強く推奨します（例: `APP_PASSWORD=好きな文字列`）。
-   これを設定しないと、URLを知っている誰でもアプリを操作できてしまいます。
+5. 環境変数を設定します:
+   - `BRAVE_SEARCH_API_KEY`: 上記「事前準備」で取得したAPIキー（**必須**。無いと検索できません）
+   - `APP_PASSWORD`: 好きな文字列（強く推奨）。これを設定しないと、URLを知っている
+     誰でもアプリを操作できてしまいます。
 6. 「Create Web Service」でデプロイ開始（初回ビルドはブラウザ同梱のため数分かかります）
 
 デプロイが終わると `https://xxxxx.onrender.com` のようなURLが発行されます。
@@ -55,7 +68,8 @@ Safariでこれを開き、共有メニュー→「ホーム画面に追加」�
 
 ### Render以外の選択肢
 [Railway](https://railway.app/) や [Fly.io](https://fly.io/) も同様にDockerfileから無料枠デプロイが可能です。
-手順はほぼ同じ（Dockerfileを検出させ、環境変数 `APP_PASSWORD` を設定するだけ）です。
+手順はほぼ同じ（Dockerfileを検出させ、環境変数 `BRAVE_SEARCH_API_KEY` と `APP_PASSWORD` を
+設定するだけ）です。
 
 ## （参考）自宅PCから使う場合
 
@@ -65,6 +79,7 @@ Tailscaleでも同じことができます。
 ### 起動
 
 ```bash
+export BRAVE_SEARCH_API_KEY=取得したAPIキー   # Windowsは set BRAVE_SEARCH_API_KEY=...
 python main.py
 ```
 
@@ -123,8 +138,8 @@ CSSセレクタで正確に位置指定する方式とは違い、「抽出キ�
 ## 注意事項
 
 - 対象サイトの利用規約・`robots.txt` を確認し、許可された範囲でご利用ください。
-- Web検索には [DuckDuckGo](https://duckduckgo.com/) の検索結果ページを利用しています。
-  短時間に大量に実行すると一時的にアクセス制限される場合があります。
+- Web検索には Brave Search API を利用しています。無料枠には検索回数の上限があるため、
+  上限に達するとその回の検索はそこまでの結果で打ち切られます（実行ログに表示されます）。
 - 開くページ数に上限を設けていないため、検索キーワードによっては非常に多くのページを
   開き続け、実行に時間がかかることがあります。様子を見ながら「実行」を止めたい場合は
   ページの再読み込みで中断できます。

@@ -2,13 +2,18 @@
 検索キーワードからWebを検索し、各ページのDOM内から抽出キーワードを含む
 テキストの塊を丸ごと抜き出すエンジン。
 CSSセレクタの指定なしで使えるように、要素の特定はキーワード一致で行う。
+
+Web検索には Brave Search API を使う（検索エンジンのHTMLページを直接
+スクレイピングする方式は、bot検知やHTML構造の変化・クラウドIPのブロックなどで
+繰り返し不安定になったため、正式なAPIに切り替えた）。
 """
 from __future__ import annotations
 
+import os
 from datetime import datetime
 from typing import Callable
-from urllib.parse import quote_plus
 
+import requests
 from playwright.sync_api import sync_playwright, Page
 
 from .config import SearchConfig
@@ -17,33 +22,18 @@ from .config import SearchConfig
 ProgressCallback = Callable[[str], None]
 
 # ヘッドレスブラウザだと分かるUser-Agent（"HeadlessChrome"表記）だと
-# 検索エンジン側にブロックされやすいため、通常のデスクトップ版と同じ
-# User-Agentを明示的に指定する。
+# サイト側にブロックされやすいため、通常のデスクトップ版と同じ
+# User-Agentを明示的に指定する（検索結果ページを開く際に使用）。
 DESKTOP_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
 
-# 検索先候補。1つ目がブロックされたり0件だったりした場合、
-# 順番に次の候補を試す（DuckDuckGoはHTML構造が変わったり、ホスティング元の
-# IPアドレスがブロックされたりすることがあるため、別ドメインのBingも用意する）。
-SEARCH_URL_TEMPLATES = [
-    "https://html.duckduckgo.com/html/?q={query}",
-    "https://lite.duckduckgo.com/lite/?q={query}",
-    "https://www.bing.com/search?q={query}",
-]
-# 上記の検索先自身のドメイン（結果リンクの抽出時に誤って拾わないよう除外する）
-SEARCH_ENGINE_OWN_DOMAINS = ("duckduckgo.com", "bing.com", "microsoft.com")
-
-# 検索ページの読み込みタイムアウト。ブロックされている場合は待っても無駄なため、
-# 通常のページ取得より短めにして、早めに次の候補へフォールバックできるようにする。
-SEARCH_GOTO_TIMEOUT_MS = 15000
-
-# html.duckduckgo.com は "&s=<開始位置>" を30件区切りで進めることで次ページを取得できる。
-# ページ数の上限はユーザーには設けず「無限」に近づけるが、検索結果が本当に尽きた後まで
-# 永遠にループし続けないよう、暴走防止の安全上限としてのみ使う。
-SEARCH_PAGE_SIZE = 30
-SEARCH_OFFSET_SAFETY_LIMIT = 3000  # 100ページ相当
+BRAVE_SEARCH_API_URL = "https://api.search.brave.com/res/v1/web/search"
+BRAVE_RESULTS_PER_PAGE = 20  # Brave Search APIの1リクエストあたりの最大件数
+# ページ数の上限はユーザーには設けないが、無料枠を使い切ってしまわないよう、
+# 暴走防止の安全上限としてのみ設ける。
+BRAVE_OFFSET_SAFETY_LIMIT = 200
 
 # ページ内でキーワード一致を探す際の、抜粋として妥当とみなすテキスト長の範囲
 MIN_SNIPPET_CHARS = 8
@@ -57,85 +47,65 @@ def _noop(_msg: str) -> None:
     pass
 
 
-def _extract_result_links(page: Page) -> list[str]:
-    """検索結果ページから、外部サイトへのリンクを取り出す。"""
-    # html.duckduckgo.com の結果リンクに使われるクラス名（変更される可能性あり）
-    hrefs = page.eval_on_selector_all("a.result__a", "els => els.map(e => e.href)")
-    if hrefs:
-        return hrefs
-    # 上記で取れない場合（lite版・Bing・構造変更時）は、外部への通常リンクを広めに拾い、
-    # 検索エンジン自身へのリンク・トラッキングリンクを除外する。
-    hrefs = page.eval_on_selector_all("a[href^='http']", "els => els.map(e => e.href)")
-    return [h for h in hrefs if h and not any(domain in h for domain in SEARCH_ENGINE_OWN_DOMAINS)]
+def _brave_search_urls(keyword: str, on_progress: ProgressCallback) -> list[str]:
+    """Brave Search APIで検索し、見つかる限りのURLを取得する（件数上限なし）。"""
+    api_key = os.environ.get("BRAVE_SEARCH_API_KEY", "").strip()
+    if not api_key:
+        raise ScrapeError(
+            "BRAVE_SEARCH_API_KEY が設定されていません。"
+            "Brave Search API (https://api-dashboard.search.brave.com/) の無料枠に登録し、"
+            "取得したAPIキーを環境変数 BRAVE_SEARCH_API_KEY に設定してください。"
+        )
 
-
-def _search_result_urls(page: Page, keyword: str, on_progress: ProgressCallback) -> list[str]:
-    """検索結果ページから、見つかる限りのURLを取得する（件数上限なし）。"""
     on_progress(f"検索中: {keyword}")
     urls: list[str] = []
     seen = set()
-
-    # 1つ目の検索先（html.duckduckgo.com）は "&s=<開始位置>" で次ページに進めるため、
-    # 新規URLが見つからなくなるまでページをめくり続ける。
-    base_template = SEARCH_URL_TEMPLATES[0]
     offset = 0
-    empty_streak = 0
-    while empty_streak < 2 and offset < SEARCH_OFFSET_SAFETY_LIMIT:
-        url = f"{base_template.format(query=quote_plus(keyword))}&s={offset}"
+
+    while offset < BRAVE_OFFSET_SAFETY_LIMIT:
         try:
-            page.goto(url, timeout=SEARCH_GOTO_TIMEOUT_MS, wait_until="domcontentloaded")
-            page.wait_for_timeout(800)
-        except Exception as e:
-            on_progress(f"  -> 検索ページの取得に失敗しました: {e}")
+            resp = requests.get(
+                BRAVE_SEARCH_API_URL,
+                params={"q": keyword, "count": BRAVE_RESULTS_PER_PAGE, "offset": offset},
+                headers={"Accept": "application/json", "X-Subscription-Token": api_key},
+                timeout=15,
+            )
+        except requests.RequestException as e:
+            on_progress(f"  -> 検索APIへの接続に失敗しました: {e}")
             break
 
-        hrefs = _extract_result_links(page)
+        if resp.status_code == 401:
+            raise ScrapeError("Brave Search APIキーが無効です。設定したAPIキーを確認してください。")
+        if resp.status_code == 429:
+            on_progress("  -> Brave Search APIのレート制限/無料枠上限に達しました。ここまでの結果で続行します。")
+            break
+        if resp.status_code != 200:
+            on_progress(f"  -> 検索APIエラー（status={resp.status_code}）: {resp.text[:200]}")
+            break
+
+        try:
+            data = resp.json()
+        except ValueError:
+            on_progress("  -> 検索APIの応答を解析できませんでした。")
+            break
+
+        results = ((data.get("web") or {}).get("results")) or []
+        if not results:
+            break
+
         new_count = 0
-        for href in hrefs:
-            if href and href not in seen:
-                seen.add(href)
-                urls.append(href)
+        for r in results:
+            url = r.get("url")
+            if url and url not in seen:
+                seen.add(url)
+                urls.append(url)
                 new_count += 1
 
         if new_count == 0:
-            empty_streak += 1
-        else:
-            empty_streak = 0
-            on_progress(f"  -> ここまでで {len(urls)} 件のページを発見。続きを確認します…")
+            break
 
-        offset += SEARCH_PAGE_SIZE
-
-    if not urls:
-        try:
-            page_title = page.title()
-        except Exception:
-            page_title = ""
-        on_progress(f"  -> html.duckduckgo.com で0件でした（ページタイトル: 「{page_title}」）。")
-
-        # フォールバック: lite版など、その他の検索先を試す（ページングはしない）
-        for template in SEARCH_URL_TEMPLATES[1:]:
-            url = template.format(query=quote_plus(keyword))
-            try:
-                page.goto(url, timeout=SEARCH_GOTO_TIMEOUT_MS, wait_until="domcontentloaded")
-                page.wait_for_timeout(800)
-            except Exception as e:
-                on_progress(f"  -> 検索ページの取得に失敗しました: {e}")
-                continue
-
-            hrefs = _extract_result_links(page)
-            for href in hrefs:
-                if href and href not in seen:
-                    seen.add(href)
-                    urls.append(href)
-
-            if urls:
-                break
-
-            try:
-                page_title = page.title()
-            except Exception:
-                page_title = ""
-            on_progress(f"  -> {template.split('/')[2]} でも0件でした（ページタイトル: 「{page_title}」）。")
+        on_progress(f"  -> ここまでで {len(urls)} 件のページを発見。続きを確認します…")
+        offset += BRAVE_RESULTS_PER_PAGE
 
     on_progress(f"  -> 検索結果 合計 {len(urls)} 件を対象にします。")
     return urls
@@ -232,6 +202,12 @@ def scrape(
     if not keywords:
         raise ScrapeError("抽出キーワードを1つ以上入力してください。")
 
+    # 検索はAPI呼び出しのみでブラウザ不要なため、Playwright起動前に済ませる
+    # （APIキー未設定などで早期に失敗する場合、ブラウザを起動する無駄を避けられる）。
+    urls = _brave_search_urls(cfg.search_keyword, on_progress)
+    if not urls:
+        on_progress("検索結果が見つかりませんでした。")
+
     results: list[dict] = []
     seen_texts: set[str] = set()
 
@@ -241,10 +217,6 @@ def scrape(
         page = context.new_page()
 
         try:
-            urls = _search_result_urls(page, cfg.search_keyword, on_progress)
-            if not urls:
-                on_progress("検索結果が見つかりませんでした。")
-
             for i, url in enumerate(urls, start=1):
                 on_progress(f"[{i}/{len(urls)}] ページを取得中: {url}")
                 try:
