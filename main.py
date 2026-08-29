@@ -157,7 +157,6 @@ def build_app(page: ft.Page):
         page.update()
 
     # ---------------- 実行セクション ----------------
-    headless_cb = ft.Checkbox(label="ブラウザを表示せず実行(headless)", value=True)
     run_button = ft.ElevatedButton("実行", icon=ft.Icons.PLAY_ARROW)
     export_button = ft.ElevatedButton("帳票出力(Excel)", icon=ft.Icons.TABLE_CHART, disabled=True)
     progress_ring = ft.ProgressRing(visible=False, width=20, height=20)
@@ -198,7 +197,7 @@ def build_app(page: ft.Page):
                 rows = scrape(
                     cfg,
                     on_progress=log,
-                    headless=headless_cb.value,
+                    headless=True,
                 )
                 state["last_rows"] = rows
                 state["last_cfg"] = cfg
@@ -264,9 +263,6 @@ def build_app(page: ft.Page):
     run_view = ft.Column([
         ft.Text("実行", weight=ft.FontWeight.BOLD, size=16),
         ft.Text("※実行する設定は「検索設定」タブで選択・保存したものが対象です", size=11, color=ft.Colors.GREY),
-        ft.ResponsiveRow([
-            ft.Container(headless_cb, col={"xs": 12, "sm": 6}),
-        ]),
         ft.Row([run_button, progress_ring, export_button], wrap=True),
         export_link,
         status_text,
