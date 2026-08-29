@@ -69,9 +69,15 @@ def _download_image_bytes(url: str) -> BytesIO | None:
         return None
 
 
+MAX_IMAGE_DIMENSION = 1280  # スケルトン加工前に縮小する上限(px)。メモリ節約のため
+
+
 def _load_image(url: str) -> Image.Image | None:
     """画像URL（そのキーワードの抽出結果に紐づく画像）をダウンロードし、
     Pillowで扱える画像として読み込む。失敗した場合は None を返す。
+    元の写真が大きいとスケルトン加工の中間処理（グレースケール・ぼかし・
+    輪郭抽出等）でメモリを多く使うため、縮小してから返す
+    （無料サーバーのメモリ上限内に収めるため）。
     """
     stream = _download_image_bytes(url)
     if stream is None:
@@ -79,7 +85,9 @@ def _load_image(url: str) -> Image.Image | None:
     try:
         img = Image.open(stream)
         img.load()
-        return img.convert("RGB")
+        img = img.convert("RGB")
+        img.thumbnail((MAX_IMAGE_DIMENSION, MAX_IMAGE_DIMENSION), Image.Resampling.LANCZOS)
+        return img
     except Exception:
         return None
 

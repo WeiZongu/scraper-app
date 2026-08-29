@@ -328,8 +328,27 @@ def scrape(
     seen_texts: set[str] = set()
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=headless)
+        # 無料サーバー(メモリ512MB程度)でもOOMで落ちないよう、コンテナ向けの
+        # 省メモリオプションを付けてChromiumを起動する。
+        browser = p.chromium.launch(
+            headless=headless,
+            args=["--disable-dev-shm-usage", "--disable-gpu", "--no-zygote"],
+        )
         context = browser.new_context(user_agent=DESKTOP_USER_AGENT, locale="ja-JP")
+        # 画像・フォントはDOMのテキストやsrc属性の取得には不要
+        # （実際に画面へ描画するわけではないため）。読み込みをブロックすることで
+        # メモリ使用量と通信量を削減できる。
+        # ※CSS(stylesheet)は innerText が「画面に表示されている文字か」を
+        #   CSSの表示状態に基づいて判定するため、ブロックすると隠し要素まで
+        #   拾ってしまい抽出結果が変わる可能性があるため対象外にする。
+        # ※動画(media)は video.currentSrc の解決に読み込みが関わる場合があるため
+        #   同様に対象外にする（件数も画像ほど多くなく、影響は小さい）。
+        context.route(
+            "**/*",
+            lambda route: route.abort()
+            if route.request.resource_type in ("image", "font")
+            else route.continue_(),
+        )
         page = context.new_page()
 
         try:
