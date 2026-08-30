@@ -1,9 +1,9 @@
 """
 検索・抽出結果を、写真を活かしたリッチなPowerPointスライドとして出力する。
 構成: 表紙スライド → 全体サマリースライド → 結果スライド（1件1枚、
-そのキーワードに紐づく画像をスケルトン風（輪郭線だけを抽出し、元画像の
-色に合わせて着色したもの）の背景として敷き、タイトルと抜粋テキストを
-中央に配置するカード風レイアウト）。
+そのキーワードに紐づく画像をフルカラースケルトン風（輪郭線部分だけ元画像の
+色をそのまま残したもの）の背景として敷き、背景に映える色のタイトルと
+抜粋テキストを中央に配置するカード風レイアウト）。
 """
 from __future__ import annotations
 
@@ -110,12 +110,13 @@ def _blend_color(
     return tuple(int(c * (1 - t) + o * t) for c, o in zip(rgb, other))
 
 
-def _make_skeleton_overlay(image: Image.Image, line_color: tuple[int, int, int]) -> Image.Image:
-    """写真から輪郭線だけを抽出し、指定色で着色した透過PNG(RGBA)を作る
-    （「背景はスケルトン風のキーワード関連画像が良い」というリクエストへの対応）。
-    グレースケール化した画像に輪郭強調フィルタ(CONTOUR)をかけて輪郭線を
-    抽出し、線の濃さをそのまま透明度に変換することで、線の部分だけ
-    不透明に色が乗った、輪郭線だけの画像（スケルトン）を作る。
+def _make_skeleton_overlay(image: Image.Image) -> Image.Image:
+    """写真から輪郭線だけを抽出し、その部分だけ元画像の色をそのまま残した
+    透過PNG(RGBA)を作る（「フルカラー画像のスケルトン」というリクエストへの対応。
+    単色の線で塗るのではなく、輪郭部分に元の写真の色そのものを見せることで、
+    フルカラーのまま輪郭線だけを抜き出したような見た目にする）。
+    グレースケール化した画像に輪郭強調フィルタ(CONTOUR)をかけて輪郭線を検出し、
+    その濃さをそのまま透明度に変換する。
     """
     gray = ImageOps.grayscale(image)
     blur_radius = max(1, min(gray.size) // 150)
@@ -129,7 +130,7 @@ def _make_skeleton_overlay(image: Image.Image, line_color: tuple[int, int, int])
     alpha = ImageOps.autocontrast(alpha)
     alpha = alpha.point(lambda v: min(255, int(v * 1.6)))
 
-    overlay = Image.new("RGBA", contour.size, line_color + (0,))
+    overlay = image.convert("RGBA")
     overlay.putalpha(alpha)
     return overlay
 
@@ -261,9 +262,10 @@ def _add_summary_slide(prs: Presentation, rows: list[dict]) -> None:
 
 def _add_result_slide(prs: Presentation, row: dict, index: int, total: int) -> None:
     """1件を1枚のカード風スライドにする。そのキーワードに紐づく画像があれば、
-    輪郭線だけを抽出し元画像の色に合わせて着色した「スケルトン風」の背景として
-    敷き、その上にタイトルと抜粋テキストを中央揃えで配置する
-    （画像が無い/読み込めない場合はアクセントカラーの単色背景になる）。
+    輪郭線部分だけ元画像のフルカラーを残した「スケルトン風」の背景として敷き、
+    その上に、背景に映えるよう画像の色合いから作った明るいアクセントカラーで
+    タイトルと抜粋テキストを中央揃えで配置する
+    （画像が無い/読み込めない場合はアクセントカラーの単色背景・白文字になる）。
     """
     slide = prs.slides.add_slide(prs.slide_layouts[6])
 
@@ -271,16 +273,19 @@ def _add_result_slide(prs: Presentation, row: dict, index: int, total: int) -> N
     if pil_image is not None:
         avg_color = _average_color(pil_image)
         canvas_color = RGBColor(*_scale_color(avg_color, 0.32))
-        line_color = _blend_color(avg_color, (255, 255, 255), 0.6)
+        # 背景（暗めのcanvas_color、およびフルカラーの輪郭線）に対して文字が
+        # 埋もれないよう、画像の色合いを保ちつつ十分に明るくしたアクセントカラーを
+        # 文字色にする（「背景に映える色」というリクエストへの対応）。
+        text_color = RGBColor(*_blend_color(avg_color, (255, 255, 255), 0.7))
     else:
         canvas_color = ACCENT_COLOR
-        line_color = None
+        text_color = WHITE
     _add_solid_rect(slide, canvas_color)
 
     has_image = False
     if pil_image is not None:
         try:
-            skeleton = _make_skeleton_overlay(pil_image, line_color)
+            skeleton = _make_skeleton_overlay(pil_image)
             has_image = _add_cover_picture(slide, skeleton)
         except Exception:
             has_image = False
@@ -294,9 +299,9 @@ def _add_result_slide(prs: Presentation, row: dict, index: int, total: int) -> N
     tf.text = row.get("keyword", "")
     p = tf.paragraphs[0]
     p.alignment = PP_ALIGN.CENTER
-    p.font.size = Pt(30)
+    p.font.size = Pt(34)
     p.font.bold = True
-    p.font.color.rgb = WHITE
+    p.font.color.rgb = text_color
 
     page_box = slide.shapes.add_textbox(SLIDE_WIDTH - Inches(1.6), Inches(0.25), Inches(1.2), Inches(0.4))
     page_box.text_frame.text = f"{index}/{total}"
@@ -312,8 +317,8 @@ def _add_result_slide(prs: Presentation, row: dict, index: int, total: int) -> N
     tf.text = row.get("text", "")
     p = tf.paragraphs[0]
     p.alignment = PP_ALIGN.CENTER
-    p.font.size = Pt(24)
-    p.font.color.rgb = WHITE
+    p.font.size = Pt(27)
+    p.font.color.rgb = text_color
 
     footer_box = slide.shapes.add_textbox(Inches(0.6), SLIDE_HEIGHT - Inches(0.9), SLIDE_WIDTH - Inches(1.2), Inches(0.7))
     tf = footer_box.text_frame
