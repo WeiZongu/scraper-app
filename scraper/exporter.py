@@ -1,9 +1,8 @@
 """
 検索・抽出結果を、写真を活かしたリッチなPowerPointスライドとして出力する。
 構成: 表紙スライド → 全体サマリースライド → 結果スライド（1件1枚、
-そのキーワードに紐づく画像をフルカラースケルトン風（輪郭線部分だけ元画像の
-色をそのまま残したもの）の背景として敷き、背景に映える色のタイトルと
-抜粋テキストを中央に配置するカード風レイアウト）。
+そのキーワードに紐づく画像を加工・フィルタなしのまま透明度を上げて背景に敷き、
+背景に映える色のタイトルと抜粋テキストを中央に配置するカード風レイアウト）。
 """
 from __future__ import annotations
 
@@ -13,7 +12,7 @@ from datetime import datetime
 from io import BytesIO
 from pathlib import Path
 
-from PIL import Image, ImageFilter, ImageOps
+from PIL import Image
 from pptx import Presentation
 from pptx.dml.color import RGBColor
 from pptx.enum.shapes import MSO_SHAPE
@@ -36,7 +35,7 @@ LINK_COLOR = RGBColor(0x9E, 0xC4, 0xFF)
 WHITE = RGBColor(0xFF, 0xFF, 0xFF)
 
 OVERLAY_ALPHA_WITH_IMAGE = 55  # 画像がある場合のオーバーレイの不透明度(%)
-SKELETON_SCRIM_ALPHA = 30  # スケルトン画像の上にかける、文字を読みやすくするための暗さ(%)
+BACKGROUND_IMAGE_OPACITY = 35  # 背景画像自体の不透明度(%)。加工はせず、透明度を上げて敷く
 DOWNLOAD_TIMEOUT_SEC = 8
 
 
@@ -110,29 +109,15 @@ def _blend_color(
     return tuple(int(c * (1 - t) + o * t) for c, o in zip(rgb, other))
 
 
-def _make_skeleton_overlay(image: Image.Image) -> Image.Image:
-    """写真から輪郭線だけを抽出し、その部分だけ元画像の色をそのまま残した
-    透過PNG(RGBA)を作る（「フルカラー画像のスケルトン」というリクエストへの対応。
-    単色の線で塗るのではなく、輪郭部分に元の写真の色そのものを見せることで、
-    フルカラーのまま輪郭線だけを抜き出したような見た目にする）。
-    グレースケール化した画像に輪郭強調フィルタ(CONTOUR)をかけて輪郭線を検出し、
-    その濃さをそのまま透明度に変換する。
+def _make_faded_picture(image: Image.Image, opacity_pct: int) -> Image.Image:
+    """写真そのものには一切加工・フィルタをかけず、画像全体を一律の不透明度に
+    した透過PNG(RGBA)を作る（背景は無加工のまま、透明度だけ上げてほしい
+    というリクエストへの対応）。下に敷いた単色キャンバスと馴染み、
+    文字が読みやすくなる。
     """
-    gray = ImageOps.grayscale(image)
-    blur_radius = max(1, min(gray.size) // 150)
-    if blur_radius > 1:
-        gray = gray.filter(ImageFilter.GaussianBlur(blur_radius))
-    contour = gray.filter(ImageFilter.CONTOUR)
-
-    # CONTOURの出力は白地(255)に輪郭が暗い線として乗るので、暗いほど
-    # 不透明になるよう反転してから透明度として使う（コントラストも強調する）。
-    alpha = ImageOps.invert(contour)
-    alpha = ImageOps.autocontrast(alpha)
-    alpha = alpha.point(lambda v: min(255, int(v * 1.6)))
-
-    overlay = image.convert("RGBA")
-    overlay.putalpha(alpha)
-    return overlay
+    faded = image.convert("RGBA")
+    faded.putalpha(int(255 * opacity_pct / 100))
+    return faded
 
 
 def _add_cover_picture(slide, pil_image: Image.Image) -> bool:
@@ -262,7 +247,7 @@ def _add_summary_slide(prs: Presentation, rows: list[dict]) -> None:
 
 def _add_result_slide(prs: Presentation, row: dict, index: int, total: int) -> None:
     """1件を1枚のカード風スライドにする。そのキーワードに紐づく画像があれば、
-    輪郭線部分だけ元画像のフルカラーを残した「スケルトン風」の背景として敷き、
+    加工・フィルタは一切かけず、透明度を上げた（薄く）状態でそのまま背景に敷き、
     その上に、背景に映えるよう画像の色合いから作った明るいアクセントカラーで
     タイトルと抜粋テキストを中央揃えで配置する
     （画像が無い/読み込めない場合はアクセントカラーの単色背景・白文字になる）。
@@ -282,16 +267,12 @@ def _add_result_slide(prs: Presentation, row: dict, index: int, total: int) -> N
         text_color = WHITE
     _add_solid_rect(slide, canvas_color)
 
-    has_image = False
     if pil_image is not None:
         try:
-            skeleton = _make_skeleton_overlay(pil_image)
-            has_image = _add_cover_picture(slide, skeleton)
+            faded = _make_faded_picture(pil_image, BACKGROUND_IMAGE_OPACITY)
+            _add_cover_picture(slide, faded)
         except Exception:
-            has_image = False
-
-    if has_image:
-        _add_solid_rect(slide, OVERLAY_COLOR, SKELETON_SCRIM_ALPHA)
+            pass
 
     title_box = slide.shapes.add_textbox(Inches(1), Inches(0.6), SLIDE_WIDTH - Inches(2), Inches(1.1))
     tf = title_box.text_frame
