@@ -17,7 +17,7 @@ from pathlib import Path
 
 import flet as ft
 
-from scraper.config import SearchConfig, list_configs, save_config, delete_config
+from scraper.config import SearchConfig, ExtractField, list_configs, save_config, delete_config
 from scraper.engine import scrape
 from scraper.exporter import export_report
 
@@ -53,7 +53,7 @@ def build_app(page: ft.Page):
     def refresh_site_list():
         site_list.controls.clear()
         for cfg in list_configs():
-            subtitle = f"検索: {cfg.search_keyword} / 抽出: {', '.join(cfg.extract_keywords)}"
+            subtitle = f"検索: {cfg.search_keyword} / 抽出: {', '.join(f.title or f.keyword for f in cfg.extract_fields)}"
             site_list.controls.append(
                 ft.ListTile(
                     title=ft.Text(cfg.name),
@@ -124,16 +124,65 @@ def build_app(page: ft.Page):
         expand=True,
         hint_text="例: 東京 ラーメン 新宿",
     )
-    extract_keywords_field = ft.TextField(
-        label="抽出キーワード（カンマ区切りで複数可。このキーワードを含む文章の塊を丸ごと抜き出します）",
-        expand=True,
-        hint_text="例: 営業時間, 定休日, 住所",
+    # 抽出項目（タイトル＋キーワードの組）を「＋」ボタンで動的に追加・削除できる
+    # ようにする。extract_field_rows に各行のコントロール参照を保持しておく。
+    extract_field_rows: list[dict] = []
+    extract_fields_list = ft.Column([])
+
+    def _make_extract_field_row(title_value: str = "", keyword_value: str = "") -> dict:
+        title_field = ft.TextField(label="抽出タイトル（表の列名）", value=title_value, expand=True, hint_text="例: 価格")
+        keyword_field = ft.TextField(
+            label='抽出キーワード（"*"でワイルドカード可）',
+            value=keyword_value,
+            expand=True,
+            hint_text="例: 価格 や 11/*",
+        )
+        row_state: dict = {"title_field": title_field, "keyword_field": keyword_field}
+
+        def remove_row(e):
+            if row_state["container"] in extract_fields_list.controls:
+                extract_fields_list.controls.remove(row_state["container"])
+            if row_state in extract_field_rows:
+                extract_field_rows.remove(row_state)
+            page.update()
+
+        header_row = ft.Row(
+            [ft.Text("抽出項目", size=11, color=ft.Colors.GREY),
+             ft.IconButton(icon=ft.Icons.DELETE_OUTLINE, icon_size=18, tooltip="この項目を削除", on_click=remove_row)],
+            alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+        )
+        container = ft.Container(
+            content=ft.Column([header_row, title_field, keyword_field], spacing=4),
+            border=ft.Border.all(1, ft.Colors.GREY_300),
+            border_radius=8,
+            padding=10,
+            margin=ft.margin.Margin(left=0, top=0, right=0, bottom=8),
+        )
+        row_state["container"] = container
+        return row_state
+
+    def add_extract_field_row(title_value: str = "", keyword_value: str = "", update: bool = True):
+        row_state = _make_extract_field_row(title_value, keyword_value)
+        extract_field_rows.append(row_state)
+        extract_fields_list.controls.append(row_state["container"])
+        if update:
+            page.update()
+
+    add_extract_field_button = ft.OutlinedButton(
+        "＋ 抽出項目を追加", icon=ft.Icons.ADD, on_click=lambda e: add_extract_field_row()
     )
+    add_extract_field_row(update=False)  # 初期表示用に1行だけ用意しておく
+
     def load_into_form(cfg: SearchConfig):
         state["current_config_name"] = cfg.name
         name_field.value = cfg.name
         search_keyword_field.value = cfg.search_keyword
-        extract_keywords_field.value = ", ".join(cfg.extract_keywords)
+        extract_field_rows.clear()
+        extract_fields_list.controls.clear()
+        for f in cfg.extract_fields:
+            add_extract_field_row(f.title, f.keyword, update=False)
+        if not cfg.extract_fields:
+            add_extract_field_row(update=False)
         tabs.selected_index = 1  # 「検索設定」タブへ切り替え
         page.update()
 
@@ -141,15 +190,21 @@ def build_app(page: ft.Page):
         state["current_config_name"] = None
         name_field.value = ""
         search_keyword_field.value = ""
-        extract_keywords_field.value = ""
+        extract_field_rows.clear()
+        extract_fields_list.controls.clear()
+        add_extract_field_row(update=False)
         page.update()
 
     def build_config_from_form() -> SearchConfig:
-        extract_keywords = [k.strip() for k in extract_keywords_field.value.split(",") if k.strip()]
+        extract_fields = [
+            ExtractField(title=row["title_field"].value.strip(), keyword=row["keyword_field"].value.strip())
+            for row in extract_field_rows
+            if row["keyword_field"].value.strip()
+        ]
         return SearchConfig(
             name=name_field.value.strip(),
             search_keyword=search_keyword_field.value.strip(),
-            extract_keywords=extract_keywords,
+            extract_fields=extract_fields,
         )
 
     def on_save(e):
@@ -180,13 +235,14 @@ def build_app(page: ft.Page):
     preview_container = ft.Column([preview_table], scroll=ft.ScrollMode.AUTO)
 
     def render_preview(cfg: SearchConfig, rows: list[dict]):
-        # 抽出キーワードがそのまま列になる（設定ごとに列数・列名が変わるため、
+        # 抽出項目のタイトルがそのまま列になる（設定ごとに列数・列名が変わるため、
         # 実行するたびに列定義を作り直す）。
-        labels = list(cfg.extract_keywords) + PREVIEW_TRAILING_LABELS
+        column_titles = [f.title.strip() or f.keyword.strip() for f in cfg.extract_fields]
+        labels = column_titles + PREVIEW_TRAILING_LABELS
         preview_table.columns = [ft.DataColumn(ft.Text(l)) for l in labels]
         preview_table.rows = [
             ft.DataRow(cells=(
-                [ft.DataCell(ft.Text(str(r["columns"].get(kw, "")))) for kw in cfg.extract_keywords]
+                [ft.DataCell(ft.Text(str(r["columns"].get(t, "")))) for t in column_titles]
                 + [
                     ft.DataCell(ft.Text(str(r.get("title", "")))),
                     ft.DataCell(ft.Text(str(r.get("url", "")))),
@@ -199,7 +255,7 @@ def build_app(page: ft.Page):
 
     def do_run(e):
         cfg = build_config_from_form()
-        if not cfg.name or not cfg.search_keyword or not cfg.extract_keywords:
+        if not cfg.name or not cfg.search_keyword or not cfg.extract_fields:
             status_text.value = "設定名・検索キーワード・抽出キーワードを入力してください。"
             page.update()
             return
@@ -283,7 +339,9 @@ def build_app(page: ft.Page):
         ft.Text("検索設定", weight=ft.FontWeight.BOLD, size=16),
         ft.ResponsiveRow([ft.Container(name_field, col=12)]),
         ft.ResponsiveRow([ft.Container(search_keyword_field, col=12)]),
-        ft.ResponsiveRow([ft.Container(extract_keywords_field, col=12)]),
+        ft.Text("抽出項目（表の列）", size=12, color=ft.Colors.GREY),
+        extract_fields_list,
+        add_extract_field_button,
         ft.Text(
             "※検索・抽出キーワードは常に日本語・英語・中国語(繁体字/簡体字)・韓国語・"
             "スペイン語に自動翻訳して多言語で検索・抽出します（翻訳は無料サービスを"

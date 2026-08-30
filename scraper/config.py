@@ -14,22 +14,51 @@ CONFIG_DIR.mkdir(exist_ok=True)
 
 
 @dataclass
-class SearchConfig:
-    """1つの検索・抽出設定。"""
-    name: str
-    search_keyword: str                        # Web検索にかけるキーワード
-    extract_keywords: list[str] = field(default_factory=list)  # ページ内で探すキーワード
-    max_snippet_chars: int = 400                # 抜粋テキストの最大文字数
+class ExtractField:
+    """1つの抽出項目（＝結果の表の1列）。
+    title: 表の列名として表示される名前（例: "価格"）。
+    keyword: ページ内で実際に探すキーワード。"*" をワイルドカードとして使える
+             （例: "11/*" は "11/15" 等にマッチする）。
+    """
+    title: str
+    keyword: str
 
     def to_dict(self) -> dict:
         return asdict(self)
 
     @staticmethod
+    def from_dict(d: dict) -> "ExtractField":
+        return ExtractField(title=d.get("title", ""), keyword=d.get("keyword", ""))
+
+
+@dataclass
+class SearchConfig:
+    """1つの検索・抽出設定。"""
+    name: str
+    search_keyword: str                        # Web検索にかけるキーワード
+    extract_fields: list[ExtractField] = field(default_factory=list)  # 抽出項目（列）
+    max_snippet_chars: int = 400                # 抜粋テキストの最大文字数
+
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "search_keyword": self.search_keyword,
+            "extract_fields": [f.to_dict() for f in self.extract_fields],
+            "max_snippet_chars": self.max_snippet_chars,
+        }
+
+    @staticmethod
     def from_dict(d: dict) -> "SearchConfig":
+        if "extract_fields" in d:
+            extract_fields = [ExtractField.from_dict(f) for f in d.get("extract_fields", [])]
+        else:
+            # 旧形式（抽出キーワードがカンマ区切りの文字列リストだった頃）からの移行。
+            # タイトルとキーワードが分かれていなかったため、同じ文字列を両方に使う。
+            extract_fields = [ExtractField(title=kw, keyword=kw) for kw in d.get("extract_keywords", [])]
         return SearchConfig(
             name=d["name"],
             search_keyword=d.get("search_keyword", ""),
-            extract_keywords=list(d.get("extract_keywords", [])),
+            extract_fields=extract_fields,
             max_snippet_chars=d.get("max_snippet_chars", 400),
         )
 

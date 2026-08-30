@@ -175,6 +175,10 @@ def _first_image_url(rows: list[dict]) -> str:
     return ""
 
 
+def _column_titles(cfg: SearchConfig) -> list[str]:
+    return [f.title.strip() or f.keyword.strip() for f in cfg.extract_fields]
+
+
 def _add_title_slide(prs: Presentation, cfg: SearchConfig, rows: list[dict]) -> None:
     slide = prs.slides.add_slide(prs.slide_layouts[6])  # 白紙レイアウト
     has_bg = _add_skeleton_background(slide, _first_image_url(rows))
@@ -199,7 +203,7 @@ def _add_title_slide(prs: Presentation, cfg: SearchConfig, rows: list[dict]) -> 
     tf.word_wrap = True
     lines = [
         f"検索キーワード: {cfg.search_keyword}",
-        f"抽出キーワード（列）: {', '.join(cfg.extract_keywords)}",
+        f"抽出キーワード（列）: {', '.join(_column_titles(cfg))}",
         f"件数: {len(rows)}件　|　作成日時: {datetime.now().strftime('%Y-%m-%d %H:%M')}",
     ]
     for i, line in enumerate(lines):
@@ -292,7 +296,8 @@ def _add_table_slide(
     page_box.text_frame.paragraphs[0].font.color.rgb = page_color
     page_box.text_frame.paragraphs[0].alignment = PP_ALIGN.RIGHT
 
-    headers = list(cfg.extract_keywords) + ["出典"]
+    column_titles = _column_titles(cfg)
+    headers = column_titles + ["出典"]
     n_cols = len(headers)
     n_rows_data = len(rows_chunk)
     n_rows = n_rows_data + 1  # ヘッダー行を含む
@@ -328,11 +333,11 @@ def _add_table_slide(
 
     for r, row in enumerate(rows_chunk, start=1):
         bg = ROW_BG_COLOR if r % 2 == 1 else ROW_BG_ALT_COLOR
-        for c, kw in enumerate(cfg.extract_keywords):
+        for c, t in enumerate(column_titles):
             cell = table.cell(r, c)
             cell.fill.solid()
             cell.fill.fore_color.rgb = bg
-            _set_cell_text(cell, row["columns"].get(kw, ""), size=12, color=TEXT_COLOR)
+            _set_cell_text(cell, row["columns"].get(t, ""), size=12, color=TEXT_COLOR)
 
         source_cell = table.cell(r, n_cols - 1)
         source_cell.fill.solid()

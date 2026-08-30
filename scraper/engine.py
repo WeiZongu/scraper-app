@@ -1,9 +1,10 @@
 """
-検索キーワードからWebを検索し、各ページのDOM内から抽出キーワード（列）が
+検索キーワードからWebを検索し、各ページのDOM内から抽出項目（列）が
 すべてそろっている(AND条件)「1件のレコード」を行データとして抜き出すエンジン。
 CSSセレクタの指定なしで使えるように、要素の特定はキーワード一致で行う。
-抽出キーワードがそのまま表の列になり、各行はキーワードごとの値（該当箇所の
-文・段落）を持つ key:value の組み合わせになる。
+各抽出項目は「タイトル（表の列名）」と「キーワード（実際に探すパターン、
+"*" によるワイルドカード可）」の組で、抽出項目がそのまま表の列になり、
+各行はタイトルごとの値（該当箇所の文・段落）を持つ key:value の組み合わせになる。
 
 Web検索には Serper.dev の Search API を使う（検索エンジンのHTMLページを直接
 スクレイピングする方式は、bot検知やHTML構造の変化・クラウドIPのブロックなどで
@@ -138,8 +139,17 @@ _EXTRACT_JS = """
     const skipTags = new Set(["SCRIPT", "STYLE", "NOSCRIPT", "HEAD"]);
     const all = document.querySelectorAll("body *");
 
+    // "*" をワイルドカードとして扱う正規表現に変換する（それ以外の正規表現
+    // 特殊文字はすべてエスケープし、単純な文字列として扱う）。
+    const escapeRegExp = (s) => s.replace(/[.*+?^${}()|[\\]\\\\]/g, "\\\\$&");
+    const patternToRegex = (pattern) => new RegExp(pattern.split("*").map(escapeRegExp).join(".*"));
+    for (const group of keywordGroups) {
+        group.regexes = group.variants.map(patternToRegex);
+    }
+
     // 1. 各キーワードグループについて、一致する最も内側の要素を集める
-    //    （グループ内のいずれかの表記＝元の言語 or 翻訳後の語に一致すればよい）
+    //    （グループ内のいずれかの表記＝元の言語 or 翻訳後の語、ワイルドカード込みで
+    //    一致すればよい）
     const leafMatches = [];
     for (const el of all) {
         if (skipTags.has(el.tagName)) continue;
@@ -147,11 +157,11 @@ _EXTRACT_JS = """
         if (!text || text.length < minLen) continue;
 
         for (const group of keywordGroups) {
-            if (!group.variants.some(v => text.includes(v))) continue;
+            if (!group.regexes.some(re => re.test(text))) continue;
             let hasMatchingChild = false;
             for (const child of el.children) {
                 const childText = (child.innerText || "").replace(/\\s+/g, " ").trim();
-                if (childText.length >= minLen && group.variants.some(v => childText.includes(v))) {
+                if (childText.length >= minLen && group.regexes.some(re => re.test(childText))) {
                     hasMatchingChild = true;
                     break;
                 }
@@ -285,16 +295,16 @@ def _merge_column_median(texts: list[str]) -> str | None:
 
 
 def _consolidate_near_duplicates(
-    rows: list[dict], keywords: list[str], on_progress: ProgressCallback
+    rows: list[dict], column_titles: list[str], on_progress: ProgressCallback
 ) -> list[dict]:
-    """各列（キーワード）の値が、数値部分だけ微妙に異なる表記ゆれの行
+    """各列（抽出項目）の値が、数値部分だけ微妙に異なる表記ゆれの行
     （別ページに載っている同じ情報等）を1件にまとめ、該当する列の数値部分を
     中央値に置き換える。数値以外の内容が異なる列がある場合は別の情報とみなし、
     その列は元の値のまま残す（＝別の行としては扱われる）。"""
     groups: dict[tuple[str, ...], list[dict]] = {}
     order: list[tuple[str, ...]] = []
     for row in rows:
-        key = tuple(_normalize_digits(row["columns"].get(kw, "")) for kw in keywords)
+        key = tuple(_normalize_digits(row["columns"].get(t, "")) for t in column_titles)
         if key not in groups:
             groups[key] = []
             order.append(key)
@@ -310,11 +320,11 @@ def _consolidate_near_duplicates(
 
         merged_columns = dict(group[0]["columns"])
         any_merged = False
-        for kw in keywords:
-            texts = [r["columns"].get(kw, "") for r in group]
+        for t in column_titles:
+            texts = [r["columns"].get(t, "") for r in group]
             merged_text = _merge_column_median(texts)
             if merged_text is not None:
-                merged_columns[kw] = merged_text
+                merged_columns[t] = merged_text
                 any_merged = True
 
         merged_row = dict(group[0])
@@ -328,34 +338,34 @@ def _consolidate_near_duplicates(
     return consolidated
 
 
-def _build_keyword_variants(
-    keywords: list[str], languages: list[str], on_progress: ProgressCallback
-) -> dict[str, str]:
-    """各キーワードを指定言語に翻訳し、"翻訳後の語 -> 元のキーワード" のマップを
-    返す（元のキーワード自身も自分自身にマップする）。複数言語で検索・抽出できる
-    ようにするための処理で、結果には常に元のキーワードで表示するために使う。
+def _translate_variants(
+    pattern: str, languages: list[str], on_progress: ProgressCallback
+) -> list[str]:
+    """1つのキーワード（パターン）を指定言語に翻訳し、[元のパターン, 翻訳後の
+    表記, ...] のリストを返す。複数言語で検索・抽出できるようにするための処理。
+    "*" を含むワイルドカードパターンは自然言語のフレーズではないため翻訳の
+    対象外とする（翻訳すると意味が壊れるため）。
     翻訳は無料の非公式サービスに依存しており失敗することがあるが、その場合は
-    そのキーワード・言語の組だけ翻訳なしでスキップし、処理は継続する。
+    そのパターン・言語の組だけ翻訳なしでスキップし、処理は継続する。
     """
-    variant_to_original: dict[str, str] = {}
-    translated_count = 0
-    attempted_count = 0
-    for kw in keywords:
-        variant_to_original.setdefault(kw, kw)
-        for lang in languages:
-            attempted_count += 1
-            translated = translate_text(kw, lang)
-            if translated and translated not in variant_to_original:
-                variant_to_original[translated] = kw
-                translated_count += 1
-                on_progress(f"  -> 翻訳({lang}): 「{kw}」→「{translated}」")
+    variants = [pattern]
+    if "*" in pattern:
+        return variants
 
-    if attempted_count and not translated_count:
+    translated_count = 0
+    for lang in languages:
+        translated = translate_text(pattern, lang)
+        if translated and translated not in variants:
+            variants.append(translated)
+            translated_count += 1
+            on_progress(f"  -> 翻訳({lang}): 「{pattern}」→「{translated}」")
+
+    if languages and not translated_count:
         on_progress(
-            "  -> 翻訳にすべて失敗しました（翻訳サービスが利用できない可能性があります）。"
-            "元のキーワードのみで続行します。"
+            f"  -> 「{pattern}」の翻訳にすべて失敗しました"
+            "（翻訳サービスが利用できない可能性があります）。元の表記のみで続行します。"
         )
-    return variant_to_original
+    return variants
 
 
 def scrape(
@@ -364,28 +374,30 @@ def scrape(
     headless: bool = True,
 ) -> list[dict]:
     """
-    検索キーワードでWebを検索し、上位ページを開いて抽出キーワードに
-    一致するテキストの塊を集める。行データのリストを返す。
+    検索キーワードでWebを検索し、上位ページを開いて抽出項目（列）が
+    すべてそろっているレコードを集める。行データのリストを返す。
     """
-    keywords = [k.strip() for k in cfg.extract_keywords if k.strip()]
-    if not keywords:
+    fields = [
+        (f.title.strip() or f.keyword.strip(), f.keyword.strip())
+        for f in cfg.extract_fields
+        if f.keyword.strip()
+    ]
+    if not fields:
         raise ScrapeError("抽出キーワードを1つ以上入力してください。")
+    column_titles = [title for title, _ in fields]
 
-    # 抽出キーワードを固定の対象言語に翻訳し、元言語以外のページでも一致するようにする。
-    # 一致した結果はどの言語（表記）で一致しても、常に元のキーワードの列として扱う。
+    # 抽出キーワード（パターン）を固定の対象言語に翻訳し、元言語以外のページでも
+    # 一致するようにする。一致した結果はどの言語（表記）で一致しても、常に
+    # 指定したタイトルの列として扱う。
     on_progress(f"抽出キーワードを {', '.join(TRANSLATE_LANGUAGES)} に翻訳しています…")
-    keyword_variants = _build_keyword_variants(keywords, TRANSLATE_LANGUAGES, on_progress)
-    variants_by_original: dict[str, list[str]] = {}
-    for variant, original in keyword_variants.items():
-        variants_by_original.setdefault(original, []).append(variant)
     keyword_groups = [
-        {"original": kw, "variants": variants_by_original.get(kw, [kw])} for kw in keywords
+        {"original": title, "variants": _translate_variants(keyword, TRANSLATE_LANGUAGES, on_progress)}
+        for title, keyword in fields
     ]
 
     # 検索キーワードも同様に翻訳し、それぞれの言語で個別に検索してURLを集める
     # （検索エンジンは基本的に検索キーワードと同じ言語のページを優先的に返すため）。
-    sk_variants = _build_keyword_variants([cfg.search_keyword], TRANSLATE_LANGUAGES, on_progress)
-    search_keywords = list(sk_variants.keys())
+    search_keywords = _translate_variants(cfg.search_keyword, TRANSLATE_LANGUAGES, on_progress)
 
     # 検索はAPI呼び出しのみでブラウザ不要なため、Playwright起動前に済ませる
     # （APIキー未設定などで早期に失敗する場合、ブラウザを起動する無駄を避けられる）。
@@ -467,11 +479,11 @@ def scrape(
 
                     added = 0
                     for m in matches:
-                        columns = {kw: m["columns"].get(kw, "") for kw in keywords}
+                        columns = {t: m["columns"].get(t, "") for t in column_titles}
                         # サイト内の別ページに同じレコード（フッターの住所など）が
                         # 繰り返し出てくることがあるため、全列の内容だけで
                         # サイト全体を通して重複排除する。
-                        dedupe_key = tuple(columns[kw] for kw in keywords)
+                        dedupe_key = tuple(columns[t] for t in column_titles)
                         if dedupe_key in seen_signatures:
                             continue
                         seen_signatures.add(dedupe_key)
@@ -492,7 +504,7 @@ def scrape(
             context.close()
             browser.close()
 
-    results = _consolidate_near_duplicates(results, keywords, on_progress)
+    results = _consolidate_near_duplicates(results, column_titles, on_progress)
 
     on_progress(f"完了: 合計 {len(results)} 件取得しました。")
     return results
