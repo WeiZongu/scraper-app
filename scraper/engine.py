@@ -1,7 +1,9 @@
 """
-検索キーワードからWebを検索し、各ページのDOM内から抽出キーワードを含む
-テキストの塊を丸ごと抜き出すエンジン。
+検索キーワードからWebを検索し、各ページのDOM内から抽出キーワード（列）が
+すべてそろっている(AND条件)「1件のレコード」を行データとして抜き出すエンジン。
 CSSセレクタの指定なしで使えるように、要素の特定はキーワード一致で行う。
+抽出キーワードがそのまま表の列になり、各行はキーワードごとの値（該当箇所の
+文・段落）を持つ key:value の組み合わせになる。
 
 Web検索には Serper.dev の Search API を使う（検索エンジンのHTMLページを直接
 スクレイピングする方式は、bot検知やHTML構造の変化・クラウドIPのブロックなどで
@@ -121,50 +123,50 @@ def _serper_search_urls(keyword: str, on_progress: ProgressCallback) -> list[str
     return urls
 
 
-# ブラウザ内(JS)で実行し、キーワードを含む「塊」を拾ってくる関数。
-# 1. まず各キーワードについて、一致する最も内側の要素（1行程度）を見つける。
-# 2. そこから、意味のあるまとまり（段落程度）になるまで親要素を数階層たどって
-#    範囲を広げる（1行だけだと情報が少なすぎるため）。
-# 3. 複数のキーワードが広げた結果、同じ段落に行き着いた場合は1件にまとめ、
-#    キーワードを併記する（重複データを作らないため）。
+# ブラウザ内(JS)で実行し、抽出キーワードを「列」とするレコード（行）を拾ってくる関数。
+# 1. まず各キーワード（グループ内のいずれかの表記に一致すればOK。多言語対応のため）に
+#    ついて、一致する最も内側の要素（1文・1段落程度）を見つける。
+# 2. そこから親要素を1階層たどって「1件分の情報」とみなせる範囲（レコード）を求め、
+#    同じ範囲に属する各キーワードの一致テキストをまとめる。
+# 3. 全キーワードがそろった（AND条件）レコードだけを結果として返す。
+#    1つでも欠けているキーワードがあるレコードは除外する。
 _EXTRACT_JS = """
 (args) => {
-    const keywords = args.keywords;
+    const keywordGroups = args.keywordGroups; // [{original, variants: [...]}, ...]
     const minLen = args.minLen;
     const maxLen = args.maxLen;
     const skipTags = new Set(["SCRIPT", "STYLE", "NOSCRIPT", "HEAD"]);
     const all = document.querySelectorAll("body *");
 
-    // 1. 各キーワードについて、一致する最も内側の要素を集める
+    // 1. 各キーワードグループについて、一致する最も内側の要素を集める
+    //    （グループ内のいずれかの表記＝元の言語 or 翻訳後の語に一致すればよい）
     const leafMatches = [];
     for (const el of all) {
         if (skipTags.has(el.tagName)) continue;
         const text = (el.innerText || "").replace(/\\s+/g, " ").trim();
         if (!text || text.length < minLen) continue;
 
-        for (const kw of keywords) {
-            if (!text.includes(kw)) continue;
+        for (const group of keywordGroups) {
+            if (!group.variants.some(v => text.includes(v))) continue;
             let hasMatchingChild = false;
             for (const child of el.children) {
                 const childText = (child.innerText || "").replace(/\\s+/g, " ").trim();
-                if (childText.length >= minLen && childText.includes(kw)) {
+                if (childText.length >= minLen && group.variants.some(v => childText.includes(v))) {
                     hasMatchingChild = true;
                     break;
                 }
             }
             if (hasMatchingChild) continue;
-            leafMatches.push({el: el, keyword: kw});
+            const snippet = text.length > maxLen ? text.slice(0, maxLen) + "…" : text;
+            leafMatches.push({el: el, keyword: group.original, text: snippet});
         }
     }
 
-    // 2. 段落程度のまとまりになるまで親要素をたどって範囲を広げる
-    //    （広げすぎて無関係な内容まで含めないよう、上限も設ける）
-    const containers = new Map(); // 要素 -> {keywords: Set, text: string}
-    for (const {el, keyword} of leafMatches) {
+    // 2. 「1件のレコード」とみなせる範囲（親要素1階層分）でグループ化する
+    //    （広げすぎて無関係な兄弟要素＝別のレコードまで含めないよう、上限も設ける）
+    const records = new Map(); // 要素 -> Map<keyword, text>
+    for (const {el, keyword, text} of leafMatches) {
         let container = el;
-        // 広げすぎて無関係な兄弟要素（別の商品カード等）まで含めてしまわないよう、
-        // 親を1階層だけたどる（多くのサイトで、これが「1件分の情報」の
-        // カード/行を囲む単位になっていることが多い）。
         for (let hops = 0; hops < 1; hops++) {
             const parent = container.parentElement;
             if (!parent) break;
@@ -173,25 +175,28 @@ _EXTRACT_JS = """
             container = parent;
         }
 
-        if (containers.has(container)) {
-            containers.get(container).keywords.add(keyword);
-        } else {
-            const containerText = (container.innerText || "").replace(/\\s+/g, " ").trim();
-            containers.set(container, {
-                keywords: new Set([keyword]),
-                text: containerText.length > maxLen ? containerText.slice(0, maxLen) + "…" : containerText,
-            });
+        if (!records.has(container)) {
+            records.set(container, new Map());
+        }
+        const values = records.get(container);
+        if (!values.has(keyword)) {
+            values.set(keyword, text);
         }
     }
 
-    // 3. 画像・動画の関連付け（まとめた段落の中、またはその近くの親要素まで）
-    //    と、テキスト内容そのものによる重複排除を行いつつ結果を組み立てる
-    const seenText = new Set();
+    // 3. 全キーワードがそろっている（AND条件）レコードのみ、画像・動画を付けて
+    //    結果を組み立てる（内容が完全に同じレコードは重複排除する）
+    const seenSignature = new Set();
     const results = [];
-    for (const [container, data] of containers.entries()) {
-        const dedupeKey = data.text.slice(0, 120);
-        if (seenText.has(dedupeKey)) continue;
-        seenText.add(dedupeKey);
+    for (const [container, values] of records.entries()) {
+        if (values.size < keywordGroups.length) continue; // 1つでも欠けていたら除外
+
+        const columns = {};
+        for (const group of keywordGroups) columns[group.original] = values.get(group.original) || "";
+
+        const signature = keywordGroups.map(g => columns[g.original]).join("\\u0001");
+        if (seenSignature.has(signature)) continue;
+        seenSignature.add(signature);
 
         let imageUrl = "";
         let videoUrl = "";
@@ -214,22 +219,17 @@ _EXTRACT_JS = """
             mediaContainer = mediaContainer.parentElement;
         }
 
-        results.push({
-            keyword: Array.from(data.keywords).join(", "),
-            text: data.text,
-            imageUrl: imageUrl,
-            videoUrl: videoUrl,
-        });
+        results.push({columns: columns, imageUrl: imageUrl, videoUrl: videoUrl});
     }
     return results;
 }
 """
 
 
-def _extract_matches(page: Page, keywords: list[str], max_snippet_chars: int) -> list[dict]:
+def _extract_matches(page: Page, keyword_groups: list[dict], max_snippet_chars: int) -> list[dict]:
     return page.evaluate(
         _EXTRACT_JS,
-        {"keywords": keywords, "minLen": MIN_SNIPPET_CHARS, "maxLen": max_snippet_chars},
+        {"keywordGroups": keyword_groups, "minLen": MIN_SNIPPET_CHARS, "maxLen": max_snippet_chars},
     )
 
 
@@ -266,14 +266,35 @@ def _median_numeric_string(raw_values: list[str]) -> str:
     return sorted_values[len(sorted_values) // 2]
 
 
-def _consolidate_near_duplicates(rows: list[dict], on_progress: ProgressCallback) -> list[dict]:
-    """同じキーワードで、数値部分だけが微妙に異なる行（別ページに載っている
-    同じ情報の表記ゆれ等）を1件にまとめ、数値部分は中央値に置き換える。
-    数値以外の部分が異なる場合は別の情報とみなし、まとめない。"""
-    groups: dict[tuple[str, str], list[dict]] = {}
-    order: list[tuple[str, str]] = []
+def _merge_column_median(texts: list[str]) -> str | None:
+    """同じ列の複数のテキストが、数値部分だけ違う表記ゆれかどうかを判定し、
+    そうであれば数値部分を中央値に置き換えたテキストを返す。数値の個数が
+    そろわない（＝数値以外の内容も違う）場合は None を返す。
+    """
+    number_lists = [_NUMBER_RE.findall(t) for t in texts]
+    n_numbers = len(number_lists[0])
+    if n_numbers == 0 or any(len(nl) != n_numbers for nl in number_lists):
+        return None
+
+    medians = [_median_numeric_string([nl[i] for nl in number_lists]) for i in range(n_numbers)]
+    parts = _NUMBER_RE.split(texts[0])
+    rebuilt = parts[0]
+    for part, med in zip(parts[1:], medians):
+        rebuilt += med + part
+    return rebuilt
+
+
+def _consolidate_near_duplicates(
+    rows: list[dict], keywords: list[str], on_progress: ProgressCallback
+) -> list[dict]:
+    """各列（キーワード）の値が、数値部分だけ微妙に異なる表記ゆれの行
+    （別ページに載っている同じ情報等）を1件にまとめ、該当する列の数値部分を
+    中央値に置き換える。数値以外の内容が異なる列がある場合は別の情報とみなし、
+    その列は元の値のまま残す（＝別の行としては扱われる）。"""
+    groups: dict[tuple[str, ...], list[dict]] = {}
+    order: list[tuple[str, ...]] = []
     for row in rows:
-        key = (row["keyword"], _normalize_digits(row["text"]))
+        key = tuple(_normalize_digits(row["columns"].get(kw, "")) for kw in keywords)
         if key not in groups:
             groups[key] = []
             order.append(key)
@@ -287,24 +308,20 @@ def _consolidate_near_duplicates(rows: list[dict], on_progress: ProgressCallback
             consolidated.append(group[0])
             continue
 
-        number_lists = [_NUMBER_RE.findall(r["text"]) for r in group]
-        n_numbers = len(number_lists[0])
-        if n_numbers == 0 or any(len(nl) != n_numbers for nl in number_lists):
-            # 数値の個数が揃わない場合はまとめ方が判断できないため、そのまま残す
-            consolidated.extend(group)
-            continue
-
-        medians = [_median_numeric_string([nl[i] for nl in number_lists]) for i in range(n_numbers)]
-        template = group[0]["text"]
-        parts = _NUMBER_RE.split(template)
-        rebuilt = parts[0]
-        for part, med in zip(parts[1:], medians):
-            rebuilt += med + part
+        merged_columns = dict(group[0]["columns"])
+        any_merged = False
+        for kw in keywords:
+            texts = [r["columns"].get(kw, "") for r in group]
+            merged_text = _merge_column_median(texts)
+            if merged_text is not None:
+                merged_columns[kw] = merged_text
+                any_merged = True
 
         merged_row = dict(group[0])
-        merged_row["text"] = rebuilt
+        merged_row["columns"] = merged_columns
         consolidated.append(merged_row)
-        merged_count += len(group) - 1
+        if any_merged:
+            merged_count += len(group) - 1
 
     if merged_count:
         on_progress(f"  -> 数値だけ異なる重複 {merged_count} 件を中央値でまとめました。")
@@ -355,10 +372,15 @@ def scrape(
         raise ScrapeError("抽出キーワードを1つ以上入力してください。")
 
     # 抽出キーワードを固定の対象言語に翻訳し、元言語以外のページでも一致するようにする。
-    # マッチした結果はどの言語のキーワードで一致しても、常に元のキーワードで表示する。
+    # 一致した結果はどの言語（表記）で一致しても、常に元のキーワードの列として扱う。
     on_progress(f"抽出キーワードを {', '.join(TRANSLATE_LANGUAGES)} に翻訳しています…")
     keyword_variants = _build_keyword_variants(keywords, TRANSLATE_LANGUAGES, on_progress)
-    keywords_for_matching = list(keyword_variants.keys())
+    variants_by_original: dict[str, list[str]] = {}
+    for variant, original in keyword_variants.items():
+        variants_by_original.setdefault(original, []).append(variant)
+    keyword_groups = [
+        {"original": kw, "variants": variants_by_original.get(kw, [kw])} for kw in keywords
+    ]
 
     # 検索キーワードも同様に翻訳し、それぞれの言語で個別に検索してURLを集める
     # （検索エンジンは基本的に検索キーワードと同じ言語のページを優先的に返すため）。
@@ -378,7 +400,7 @@ def scrape(
         on_progress("検索結果が見つかりませんでした。")
 
     results: list[dict] = []
-    seen_texts: set[str] = set()
+    seen_signatures: set[tuple[str, ...]] = set()
 
     with sync_playwright() as p:
         def launch():
@@ -438,29 +460,23 @@ def scrape(
                         pass
 
                     try:
-                        matches = _extract_matches(page, keywords_for_matching, cfg.max_snippet_chars)
+                        matches = _extract_matches(page, keyword_groups, cfg.max_snippet_chars)
                     except Exception as e:
                         on_progress(f"  -> 抽出失敗: {e}")
                         continue
 
                     added = 0
                     for m in matches:
-                        # サイト内の別ページに同じ文章（フッターの住所など）が
-                        # 繰り返し出てくることがあるため、テキスト内容だけで
+                        columns = {kw: m["columns"].get(kw, "") for kw in keywords}
+                        # サイト内の別ページに同じレコード（フッターの住所など）が
+                        # 繰り返し出てくることがあるため、全列の内容だけで
                         # サイト全体を通して重複排除する。
-                        dedupe_key = m["text"]
-                        if dedupe_key in seen_texts:
+                        dedupe_key = tuple(columns[kw] for kw in keywords)
+                        if dedupe_key in seen_signatures:
                             continue
-                        seen_texts.add(dedupe_key)
-                        # 翻訳したキーワード（他言語）が一致した場合も、表示上は
-                        # 常に元のキーワードにまとめる（結果やサマリーが言語ごとに
-                        # 分散してしまわないようにするため）。
-                        matched_keyword = ", ".join(dict.fromkeys(
-                            keyword_variants.get(k, k) for k in m["keyword"].split(", ")
-                        ))
+                        seen_signatures.add(dedupe_key)
                         results.append({
-                            "keyword": matched_keyword,
-                            "text": m["text"],
+                            "columns": columns,
                             "image_url": m.get("imageUrl", ""),
                             "video_url": m.get("videoUrl", ""),
                             "title": title,
@@ -476,7 +492,7 @@ def scrape(
             context.close()
             browser.close()
 
-    results = _consolidate_near_duplicates(results, on_progress)
+    results = _consolidate_near_duplicates(results, keywords, on_progress)
 
     on_progress(f"完了: 合計 {len(results)} 件取得しました。")
     return results

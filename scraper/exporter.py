@@ -1,24 +1,19 @@
 """
-検索・抽出結果を、写真を活かしたリッチなPowerPointスライドとして出力する。
-構成: 表紙スライド → 全体サマリースライド → 結果スライド（1件1枚、
-そのキーワードに紐づく画像を加工・フィルタなしのまま透明度を上げて背景に敷き、
-背景に映える色のタイトルと抜粋テキストを中央に配置するカード風レイアウト）。
+検索・抽出結果を、抽出キーワードを列とする表形式のPowerPointスライドとして
+出力する。構成: 表紙スライド → 表スライド（1ページ5行、5行を超える分は
+複数スライドに分割）。各行は抽出キーワードすべてを含む(AND条件)1件の
+レコードで、列の値は該当キーワードを含む文・段落そのもの。
 """
 from __future__ import annotations
 
-import urllib.request
-from collections import Counter
+import math
 from datetime import datetime
-from io import BytesIO
 from pathlib import Path
 
-from PIL import Image
 from pptx import Presentation
 from pptx.dml.color import RGBColor
 from pptx.enum.shapes import MSO_SHAPE
-from pptx.enum.text import MSO_ANCHOR, MSO_AUTO_SIZE, PP_ALIGN
-from pptx.oxml.ns import qn
-from pptx.oxml.xmlchemy import OxmlElement
+from pptx.enum.text import MSO_ANCHOR, PP_ALIGN
 from pptx.util import Inches, Pt
 
 from .config import SearchConfig
@@ -27,142 +22,29 @@ SLIDE_WIDTH = Inches(13.333)
 SLIDE_HEIGHT = Inches(7.5)
 
 ACCENT_COLOR = RGBColor(0x30, 0x54, 0x96)
-OVERLAY_COLOR = RGBColor(0x0A, 0x0E, 0x1A)
-SUMMARY_BG_COLOR = RGBColor(0xF5, 0xF6, 0xFA)
-TEXT_COLOR = RGBColor(0x33, 0x33, 0x33)
-MUTED_COLOR = RGBColor(0xC7, 0xCC, 0xD8)
-LINK_COLOR = RGBColor(0x9E, 0xC4, 0xFF)
+HEADER_TEXT_COLOR = RGBColor(0xFF, 0xFF, 0xFF)
+ROW_BG_COLOR = RGBColor(0xFF, 0xFF, 0xFF)
+ROW_BG_ALT_COLOR = RGBColor(0xF0, 0xF3, 0xFA)
+TEXT_COLOR = RGBColor(0x2B, 0x2B, 0x2B)
+MUTED_COLOR = RGBColor(0x6B, 0x6B, 0x6B)
+LINK_COLOR = RGBColor(0x1A, 0x4B, 0x9E)
 WHITE = RGBColor(0xFF, 0xFF, 0xFF)
 
-OVERLAY_ALPHA_WITH_IMAGE = 55  # 画像がある場合のオーバーレイの不透明度(%)
-BACKGROUND_IMAGE_OPACITY = 35  # 背景画像自体の不透明度(%)。加工はせず、透明度を上げて敷く
-DOWNLOAD_TIMEOUT_SEC = 8
+ROWS_PER_SLIDE = 5  # 1ページあたりの表示行数（ヘッダー行は別）
 
 
-def _set_transparency(fill, alpha_pct: int) -> None:
-    """python-pptxには塗りつぶし透明度の公開APIが無いため、XMLを直接操作する。
-    alpha_pct: 0(完全に透明)〜100(完全に不透明)
-    """
-    color_elm = fill.fore_color._xFill.find(qn("a:srgbClr"))
-    if color_elm is None:
-        color_elm = fill.fore_color._xFill.find(qn("a:schemeClr"))
-    if color_elm is None:
-        return
-    alpha = OxmlElement("a:alpha")
-    alpha.set("val", str(int(alpha_pct * 1000)))
-    color_elm.append(alpha)
-
-
-def _download_image_bytes(url: str) -> BytesIO | None:
-    """画像URLをダウンロードする。失敗した場合は None を返す
-    （呼び出し側は画像なしでスライドを作る等でフォールバックする）。
-    """
-    if not url:
-        return None
-    try:
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=DOWNLOAD_TIMEOUT_SEC) as resp:
-            data = resp.read()
-        return BytesIO(data)
-    except Exception:
-        return None
-
-
-MAX_IMAGE_DIMENSION = 1280  # スケルトン加工前に縮小する上限(px)。メモリ節約のため
-
-
-def _load_image(url: str) -> Image.Image | None:
-    """画像URL（そのキーワードの抽出結果に紐づく画像）をダウンロードし、
-    Pillowで扱える画像として読み込む。失敗した場合は None を返す。
-    元の写真が大きいとスケルトン加工の中間処理（グレースケール・ぼかし・
-    輪郭抽出等）でメモリを多く使うため、縮小してから返す
-    （無料サーバーのメモリ上限内に収めるため）。
-    """
-    stream = _download_image_bytes(url)
-    if stream is None:
-        return None
-    try:
-        img = Image.open(stream)
-        img.load()
-        img = img.convert("RGB")
-        img.thumbnail((MAX_IMAGE_DIMENSION, MAX_IMAGE_DIMENSION), Image.Resampling.LANCZOS)
-        return img
-    except Exception:
-        return None
-
-
-def _average_color(image: Image.Image) -> tuple[int, int, int]:
-    """画像を1pxに縮小し、全体の平均色を取得する（「カラーは画像に合わせる」
-    ための、背景・線の色のベースとして使う）。
-    """
-    small = image.resize((1, 1), Image.Resampling.LANCZOS)
-    return small.getpixel((0, 0))
-
-
-def _scale_color(rgb: tuple[int, int, int], factor: float) -> tuple[int, int, int]:
-    return tuple(min(255, max(0, int(c * factor))) for c in rgb)
-
-
-def _blend_color(
-    rgb: tuple[int, int, int], other: tuple[int, int, int], t: float
-) -> tuple[int, int, int]:
-    return tuple(int(c * (1 - t) + o * t) for c, o in zip(rgb, other))
-
-
-def _make_faded_picture(image: Image.Image, opacity_pct: int) -> Image.Image:
-    """写真そのものには一切加工・フィルタをかけず、画像全体を一律の不透明度に
-    した透過PNG(RGBA)を作る（背景は無加工のまま、透明度だけ上げてほしい
-    というリクエストへの対応）。下に敷いた単色キャンバスと馴染み、
-    文字が読みやすくなる。
-    """
-    faded = image.convert("RGBA")
-    faded.putalpha(int(255 * opacity_pct / 100))
-    return faded
-
-
-def _add_cover_picture(slide, pil_image: Image.Image) -> bool:
-    """画像（PIL Image、透過PNGも可）をスライド全体を覆うように拡大配置する
-    （はみ出た部分はスライド外に出るため、PowerPoint上では自動的に切り取られて
-    表示される）。失敗したら False。
-    """
-    try:
-        buf = BytesIO()
-        pil_image.save(buf, format="PNG")
-        buf.seek(0)
-        pic = slide.shapes.add_picture(buf, 0, 0)
-        scale = max(SLIDE_WIDTH / pic.width, SLIDE_HEIGHT / pic.height)
-        new_w = int(pic.width * scale)
-        new_h = int(pic.height * scale)
-        pic.width = new_w
-        pic.height = new_h
-        pic.left = int((SLIDE_WIDTH - new_w) / 2)
-        pic.top = int((SLIDE_HEIGHT - new_h) / 2)
-        return True
-    except Exception:
-        return False
-
-
-def _add_solid_rect(slide, rgb: RGBColor, alpha_pct: int | None = None):
+def _add_solid_rect(slide, rgb: RGBColor):
     shape = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, 0, 0, SLIDE_WIDTH, SLIDE_HEIGHT)
     shape.line.fill.background()
     shape.shadow.inherit = False
     shape.fill.solid()
     shape.fill.fore_color.rgb = rgb
-    if alpha_pct is not None:
-        _set_transparency(shape.fill, alpha_pct)
     return shape
-
-
-def _add_overlay(slide, has_image: bool) -> None:
-    if has_image:
-        _add_solid_rect(slide, OVERLAY_COLOR, OVERLAY_ALPHA_WITH_IMAGE)
-    else:
-        _add_solid_rect(slide, ACCENT_COLOR)
 
 
 def _add_title_slide(prs: Presentation, cfg: SearchConfig, count: int) -> None:
     slide = prs.slides.add_slide(prs.slide_layouts[6])  # 白紙レイアウト
-    _add_overlay(slide, has_image=False)
+    _add_solid_rect(slide, ACCENT_COLOR)
 
     title_box = slide.shapes.add_textbox(Inches(1), Inches(2.6), SLIDE_WIDTH - Inches(2), Inches(1.5))
     tf = title_box.text_frame
@@ -179,7 +61,7 @@ def _add_title_slide(prs: Presentation, cfg: SearchConfig, count: int) -> None:
     tf.word_wrap = True
     lines = [
         f"検索キーワード: {cfg.search_keyword}",
-        f"抽出キーワード: {', '.join(cfg.extract_keywords)}",
+        f"抽出キーワード（列）: {', '.join(cfg.extract_keywords)}",
         f"件数: {count}件　|　作成日時: {datetime.now().strftime('%Y-%m-%d %H:%M')}",
     ]
     for i, line in enumerate(lines):
@@ -187,172 +69,156 @@ def _add_title_slide(prs: Presentation, cfg: SearchConfig, count: int) -> None:
         p.text = line
         p.alignment = PP_ALIGN.CENTER
         p.font.size = Pt(16)
-        p.font.color.rgb = MUTED_COLOR
+        p.font.color.rgb = RGBColor(0xD7, 0xDF, 0xF2)
         p.space_after = Pt(8)
 
 
-def _add_summary_slide(prs: Presentation, rows: list[dict]) -> None:
-    """抽出キーワードごとの件数を一覧できる、全体サマリースライドを1枚追加する。
-    キーワードを増やすほど個々の結果スライドの話題が分散して見えるため、
-    冒頭で全体像を掴めるようにする。
-    """
-    slide = prs.slides.add_slide(prs.slide_layouts[6])
-
-    bg = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, 0, 0, SLIDE_WIDTH, SLIDE_HEIGHT)
-    bg.line.fill.background()
-    bg.shadow.inherit = False
-    bg.fill.solid()
-    bg.fill.fore_color.rgb = SUMMARY_BG_COLOR
-
-    title_box = slide.shapes.add_textbox(Inches(0.7), Inches(0.5), Inches(12), Inches(0.9))
-    tf = title_box.text_frame
-    tf.text = "全体サマリー"
-    tf.paragraphs[0].font.size = Pt(30)
-    tf.paragraphs[0].font.bold = True
-    tf.paragraphs[0].font.color.rgb = ACCENT_COLOR
-
-    counter: Counter[str] = Counter()
-    for row in rows:
-        for kw in str(row.get("keyword", "")).split(","):
-            kw = kw.strip()
-            if kw:
-                counter[kw] += 1
-
-    body_box = slide.shapes.add_textbox(Inches(0.9), Inches(1.7), Inches(11.5), Inches(5.3))
-    tf = body_box.text_frame
+def _set_cell_text(cell, text: str, *, size: int, color: RGBColor, bold: bool = False) -> None:
+    tf = cell.text_frame
     tf.word_wrap = True
+    tf.vertical_anchor = MSO_ANCHOR.TOP
+    tf.text = text
+    p = tf.paragraphs[0]
+    p.font.size = Pt(size)
+    p.font.bold = bold
+    p.font.color.rgb = color
+
+
+def _add_source_cell(cell, title: str, url: str, video_url: str, fetched_at: str) -> None:
+    tf = cell.text_frame
+    tf.word_wrap = True
+    tf.vertical_anchor = MSO_ANCHOR.TOP
 
     p = tf.paragraphs[0]
-    p.text = f"取得件数: 合計 {len(rows)} 件"
-    p.font.size = Pt(22)
+    p.text = title
+    p.font.size = Pt(10)
     p.font.bold = True
     p.font.color.rgb = TEXT_COLOR
-    p.space_after = Pt(20)
-
-    if counter:
-        p = tf.add_paragraph()
-        p.text = "キーワード別の件数"
-        p.font.size = Pt(18)
-        p.font.bold = True
-        p.font.color.rgb = ACCENT_COLOR
-        p.space_after = Pt(10)
-
-        for kw, cnt in counter.most_common():
-            p = tf.add_paragraph()
-            p.text = f"　・{kw}　―　{cnt} 件"
-            p.font.size = Pt(18)
-            p.font.color.rgb = TEXT_COLOR
-            p.space_after = Pt(8)
-
-
-def _add_result_slide(prs: Presentation, row: dict, index: int, total: int) -> None:
-    """1件を1枚のカード風スライドにする。そのキーワードに紐づく画像があれば、
-    加工・フィルタは一切かけず、透明度を上げた（薄く）状態でそのまま背景に敷き、
-    その上に、背景に映えるよう画像の色合いから作った明るいアクセントカラーで
-    タイトルと抜粋テキストを中央揃えで配置する
-    （画像が無い/読み込めない場合はアクセントカラーの単色背景・白文字になる）。
-    """
-    slide = prs.slides.add_slide(prs.slide_layouts[6])
-
-    pil_image = _load_image(row.get("image_url", ""))
-    if pil_image is not None:
-        avg_color = _average_color(pil_image)
-        canvas_color = RGBColor(*_scale_color(avg_color, 0.32))
-        # 背景（暗めのcanvas_color、およびフルカラーの輪郭線）に対して文字が
-        # 埋もれないよう、画像の色合いを保ちつつ十分に明るくしたアクセントカラーを
-        # 文字色にする（「背景に映える色」というリクエストへの対応）。
-        text_color = RGBColor(*_blend_color(avg_color, (255, 255, 255), 0.7))
-    else:
-        canvas_color = ACCENT_COLOR
-        text_color = WHITE
-    _add_solid_rect(slide, canvas_color)
-
-    if pil_image is not None:
-        try:
-            faded = _make_faded_picture(pil_image, BACKGROUND_IMAGE_OPACITY)
-            _add_cover_picture(slide, faded)
-        except Exception:
-            pass
-
-    title_box = slide.shapes.add_textbox(Inches(1), Inches(0.6), SLIDE_WIDTH - Inches(2), Inches(1.1))
-    tf = title_box.text_frame
-    tf.word_wrap = True
-    tf.text = row.get("keyword", "")
-    p = tf.paragraphs[0]
-    p.alignment = PP_ALIGN.CENTER
-    p.font.size = Pt(34)
-    p.font.bold = True
-    p.font.color.rgb = text_color
-
-    page_box = slide.shapes.add_textbox(SLIDE_WIDTH - Inches(1.6), Inches(0.25), Inches(1.2), Inches(0.4))
-    page_box.text_frame.text = f"{index}/{total}"
-    page_box.text_frame.paragraphs[0].font.size = Pt(12)
-    page_box.text_frame.paragraphs[0].font.color.rgb = MUTED_COLOR
-    page_box.text_frame.paragraphs[0].alignment = PP_ALIGN.RIGHT
-
-    body_box = slide.shapes.add_textbox(Inches(1.3), Inches(2.0), SLIDE_WIDTH - Inches(2.6), Inches(3.9))
-    tf = body_box.text_frame
-    tf.word_wrap = True
-    tf.vertical_anchor = MSO_ANCHOR.MIDDLE
-    tf.auto_size = MSO_AUTO_SIZE.NONE
-    tf.text = row.get("text", "")
-    p = tf.paragraphs[0]
-    p.alignment = PP_ALIGN.CENTER
-    p.font.size = Pt(27)
-    p.font.color.rgb = text_color
-
-    footer_box = slide.shapes.add_textbox(Inches(0.6), SLIDE_HEIGHT - Inches(0.9), SLIDE_WIDTH - Inches(1.2), Inches(0.7))
-    tf = footer_box.text_frame
-    tf.word_wrap = True
-
-    title = row.get("title", "")
-    url = row.get("url", "")
-    video_url = row.get("video_url", "")
-    fetched_at = row.get("fetched_at", "")
-
-    p = tf.paragraphs[0]
-    p.alignment = PP_ALIGN.CENTER
-    p.text = f"出典: {title}　"
-    p.font.size = Pt(11)
-    p.font.color.rgb = MUTED_COLOR
 
     if url:
-        run = p.add_run()
+        p_url = tf.add_paragraph()
+        run = p_url.add_run()
         run.text = url
-        run.font.size = Pt(11)
+        run.font.size = Pt(9)
         run.font.color.rgb = LINK_COLOR
         run.font.underline = True
         run.hyperlink.address = url
 
     if video_url:
-        run = p.add_run()
-        run.text = "　[動画を見る]"
-        run.font.size = Pt(11)
+        p_video = tf.add_paragraph()
+        run = p_video.add_run()
+        run.text = "[動画を見る]"
+        run.font.size = Pt(9)
         run.font.color.rgb = LINK_COLOR
         run.font.underline = True
         run.hyperlink.address = video_url
 
-    p2 = tf.add_paragraph()
-    p2.alignment = PP_ALIGN.CENTER
-    p2.text = f"取得日時: {fetched_at}"
-    p2.font.size = Pt(10)
-    p2.font.color.rgb = MUTED_COLOR
+    p_date = tf.add_paragraph()
+    p_date.text = fetched_at
+    p_date.font.size = Pt(8)
+    p_date.font.color.rgb = MUTED_COLOR
+
+
+def _add_table_slide(
+    prs: Presentation,
+    cfg: SearchConfig,
+    rows_chunk: list[dict],
+    page_num: int,
+    total_pages: int,
+) -> None:
+    """抽出キーワードを列とする表を1枚のスライドに描画する（最大 ROWS_PER_SLIDE 行）。
+    セル内のテキストは折り返し表示にする（複数行になった場合も枠内に収める）。
+    """
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    _add_solid_rect(slide, RGBColor(0xFA, 0xFB, 0xFD))
+
+    title_box = slide.shapes.add_textbox(Inches(0.5), Inches(0.25), Inches(10), Inches(0.6))
+    tf = title_box.text_frame
+    tf.text = cfg.name or "検索結果"
+    tf.paragraphs[0].font.size = Pt(20)
+    tf.paragraphs[0].font.bold = True
+    tf.paragraphs[0].font.color.rgb = ACCENT_COLOR
+
+    page_box = slide.shapes.add_textbox(SLIDE_WIDTH - Inches(1.8), Inches(0.3), Inches(1.3), Inches(0.4))
+    page_box.text_frame.text = f"{page_num}/{total_pages}"
+    page_box.text_frame.paragraphs[0].font.size = Pt(12)
+    page_box.text_frame.paragraphs[0].font.color.rgb = MUTED_COLOR
+    page_box.text_frame.paragraphs[0].alignment = PP_ALIGN.RIGHT
+
+    headers = list(cfg.extract_keywords) + ["出典"]
+    n_cols = len(headers)
+    n_rows_data = len(rows_chunk)
+    n_rows = n_rows_data + 1  # ヘッダー行を含む
+
+    table_left = Inches(0.5)
+    table_top = Inches(1.1)
+    table_width = SLIDE_WIDTH - Inches(1.0)
+    table_height = SLIDE_HEIGHT - Inches(1.4)
+
+    graphic_frame = slide.shapes.add_table(n_rows, n_cols, table_left, table_top, table_width, table_height)
+    table = graphic_frame.table
+    table.first_row = False
+    table.horz_banding = False
+
+    # 列幅: 「出典」列は少し広めに、残りをキーワード列で均等割りする
+    source_col_width = Inches(2.6)
+    keyword_col_width = int((table_width - source_col_width) / max(1, n_cols - 1))
+    for c in range(n_cols - 1):
+        table.columns[c].width = keyword_col_width
+    table.columns[n_cols - 1].width = table_width - keyword_col_width * (n_cols - 1)
+
+    header_row_height = Inches(0.5)
+    data_row_height = int((table_height - header_row_height) / max(1, n_rows_data))
+    table.rows[0].height = header_row_height
+    for r in range(1, n_rows):
+        table.rows[r].height = data_row_height
+
+    for c, header in enumerate(headers):
+        cell = table.cell(0, c)
+        cell.fill.solid()
+        cell.fill.fore_color.rgb = ACCENT_COLOR
+        _set_cell_text(cell, header, size=13, color=HEADER_TEXT_COLOR, bold=True)
+
+    for r, row in enumerate(rows_chunk, start=1):
+        bg = ROW_BG_COLOR if r % 2 == 1 else ROW_BG_ALT_COLOR
+        for c, kw in enumerate(cfg.extract_keywords):
+            cell = table.cell(r, c)
+            cell.fill.solid()
+            cell.fill.fore_color.rgb = bg
+            _set_cell_text(cell, row["columns"].get(kw, ""), size=12, color=TEXT_COLOR)
+
+        source_cell = table.cell(r, n_cols - 1)
+        source_cell.fill.solid()
+        source_cell.fill.fore_color.rgb = bg
+        _add_source_cell(
+            source_cell,
+            title=row.get("title", ""),
+            url=row.get("url", ""),
+            video_url=row.get("video_url", ""),
+            fetched_at=row.get("fetched_at", ""),
+        )
 
 
 def export_report(cfg: SearchConfig, rows: list[dict], output_path: Path) -> Path:
     """
     rows: engine.scrape() が返す辞書のリスト
-          （keyword / text / image_url / video_url / title / url / fetched_at の各キーを持つ）
-    表紙 → 全体サマリー → 結果スライド（1件1枚）の順に構成する。
+          （columns: {キーワード: 値, ...} / image_url / video_url / title / url /
+          fetched_at の各キーを持つ）
+    表紙 → 表スライド（1ページ ROWS_PER_SLIDE 行）の順に構成する。
     """
     prs = Presentation()
     prs.slide_width = SLIDE_WIDTH
     prs.slide_height = SLIDE_HEIGHT
 
     _add_title_slide(prs, cfg, len(rows))
-    _add_summary_slide(prs, rows)
-    for i, row in enumerate(rows, start=1):
-        _add_result_slide(prs, row, i, len(rows))
+
+    total_pages = max(1, math.ceil(len(rows) / ROWS_PER_SLIDE))
+    for page_num in range(1, total_pages + 1):
+        start = (page_num - 1) * ROWS_PER_SLIDE
+        chunk = rows[start:start + ROWS_PER_SLIDE]
+        if not chunk:
+            continue
+        _add_table_slide(prs, cfg, chunk, page_num, total_pages)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     prs.save(output_path)

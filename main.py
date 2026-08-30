@@ -33,8 +33,9 @@ logger = logging.getLogger("scraper_app")
 
 APP_PASSWORD = os.environ.get("APP_PASSWORD", "")  # 空文字なら認証なし
 
-PREVIEW_COLUMNS = ["keyword", "text", "image_url", "video_url", "title", "url", "fetched_at"]
-PREVIEW_LABELS = ["キーワード", "抜粋テキスト", "画像URL", "動画URL", "ページタイトル", "URL", "取得日時"]
+# プレビューの列は抽出キーワード（設定ごとに異なる）が実行時に決まるため、
+# 固定の末尾列だけをここで定義する（先頭にキーワード列が動的に追加される）。
+PREVIEW_TRAILING_LABELS = ["ページタイトル", "URL", "取得日時"]
 
 
 def build_app(page: ft.Page):
@@ -175,12 +176,23 @@ def build_app(page: ft.Page):
         log_view.controls.append(ft.Text(msg, size=11, font_family="monospace"))
         page.update()
 
-    preview_table = ft.DataTable(columns=[ft.DataColumn(ft.Text(l)) for l in PREVIEW_LABELS], rows=[])
+    preview_table = ft.DataTable(columns=[ft.DataColumn(ft.Text(""))], rows=[])
     preview_container = ft.Column([preview_table], scroll=ft.ScrollMode.AUTO)
 
-    def render_preview(rows: list[dict]):
+    def render_preview(cfg: SearchConfig, rows: list[dict]):
+        # 抽出キーワードがそのまま列になる（設定ごとに列数・列名が変わるため、
+        # 実行するたびに列定義を作り直す）。
+        labels = list(cfg.extract_keywords) + PREVIEW_TRAILING_LABELS
+        preview_table.columns = [ft.DataColumn(ft.Text(l)) for l in labels]
         preview_table.rows = [
-            ft.DataRow(cells=[ft.DataCell(ft.Text(str(r.get(c, "")))) for c in PREVIEW_COLUMNS])
+            ft.DataRow(cells=(
+                [ft.DataCell(ft.Text(str(r["columns"].get(kw, "")))) for kw in cfg.extract_keywords]
+                + [
+                    ft.DataCell(ft.Text(str(r.get("title", "")))),
+                    ft.DataCell(ft.Text(str(r.get("url", "")))),
+                    ft.DataCell(ft.Text(str(r.get("fetched_at", "")))),
+                ]
+            ))
             for r in rows[:200]  # プレビューは最大200件
         ]
         page.update()
@@ -208,7 +220,7 @@ def build_app(page: ft.Page):
                 )
                 state["last_rows"] = rows
                 state["last_cfg"] = cfg
-                render_preview(rows)
+                render_preview(cfg, rows)
                 status_text.value = f"完了: {len(rows)} 件取得しました。"
                 export_button.disabled = len(rows) == 0
             except Exception as ex:
