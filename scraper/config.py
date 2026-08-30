@@ -20,6 +20,9 @@ class SearchConfig:
     search_keyword: str                        # Web検索にかけるキーワード
     extract_keywords: list[str] = field(default_factory=list)  # ページ内で探すキーワード
     max_snippet_chars: int = 400                # 抜粋テキストの最大文字数
+    # 検索・抽出キーワードをこれらの言語にも翻訳し、多言語で検索・抽出する
+    # （例: ["en", "zh-TW"]）。空リストなら翻訳せず、入力したキーワードのみで動作する。
+    translate_languages: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -31,6 +34,7 @@ class SearchConfig:
             search_keyword=d.get("search_keyword", ""),
             extract_keywords=list(d.get("extract_keywords", [])),
             max_snippet_chars=d.get("max_snippet_chars", 400),
+            translate_languages=list(d.get("translate_languages", [])),
         )
 
 

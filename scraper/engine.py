@@ -20,6 +20,7 @@ import requests
 from playwright.sync_api import sync_playwright, Page
 
 from .config import SearchConfig
+from .translate import translate_text
 
 # 進捗通知用コールバックの型: (message: str) -> None
 ProgressCallback = Callable[[str], None]
@@ -305,6 +306,36 @@ def _consolidate_near_duplicates(rows: list[dict], on_progress: ProgressCallback
     return consolidated
 
 
+def _build_keyword_variants(
+    keywords: list[str], languages: list[str], on_progress: ProgressCallback
+) -> dict[str, str]:
+    """各キーワードを指定言語に翻訳し、"翻訳後の語 -> 元のキーワード" のマップを
+    返す（元のキーワード自身も自分自身にマップする）。複数言語で検索・抽出できる
+    ようにするための処理で、結果には常に元のキーワードで表示するために使う。
+    翻訳は無料の非公式サービスに依存しており失敗することがあるが、その場合は
+    そのキーワード・言語の組だけ翻訳なしでスキップし、処理は継続する。
+    """
+    variant_to_original: dict[str, str] = {}
+    translated_count = 0
+    attempted_count = 0
+    for kw in keywords:
+        variant_to_original.setdefault(kw, kw)
+        for lang in languages:
+            attempted_count += 1
+            translated = translate_text(kw, lang)
+            if translated and translated not in variant_to_original:
+                variant_to_original[translated] = kw
+                translated_count += 1
+                on_progress(f"  -> 翻訳({lang}): 「{kw}」→「{translated}」")
+
+    if attempted_count and not translated_count:
+        on_progress(
+            "  -> 翻訳にすべて失敗しました（翻訳サービスが利用できない可能性があります）。"
+            "元のキーワードのみで続行します。"
+        )
+    return variant_to_original
+
+
 def scrape(
     cfg: SearchConfig,
     on_progress: ProgressCallback = _noop,
@@ -318,9 +349,33 @@ def scrape(
     if not keywords:
         raise ScrapeError("抽出キーワードを1つ以上入力してください。")
 
+    languages = [lang.strip() for lang in cfg.translate_languages if lang.strip()]
+
+    # 抽出キーワードを指定言語に翻訳し、元言語以外のページでも一致するようにする。
+    # マッチした結果はどの言語のキーワードで一致しても、常に元のキーワードで表示する。
+    keyword_variants: dict[str, str] = {}
+    keywords_for_matching = keywords
+    if languages:
+        on_progress(f"抽出キーワードを {', '.join(languages)} に翻訳しています…")
+        keyword_variants = _build_keyword_variants(keywords, languages, on_progress)
+        keywords_for_matching = list(keyword_variants.keys())
+
+    # 検索キーワードも同様に翻訳し、それぞれの言語で個別に検索してURLを集める
+    # （検索エンジンは基本的に検索キーワードと同じ言語のページを優先的に返すため）。
+    search_keywords = [cfg.search_keyword]
+    if languages:
+        sk_variants = _build_keyword_variants([cfg.search_keyword], languages, on_progress)
+        search_keywords = list(sk_variants.keys())
+
     # 検索はAPI呼び出しのみでブラウザ不要なため、Playwright起動前に済ませる
     # （APIキー未設定などで早期に失敗する場合、ブラウザを起動する無駄を避けられる）。
-    urls = _serper_search_urls(cfg.search_keyword, on_progress)
+    urls: list[str] = []
+    seen_urls: set[str] = set()
+    for sk in search_keywords:
+        for url in _serper_search_urls(sk, on_progress):
+            if url not in seen_urls:
+                seen_urls.add(url)
+                urls.append(url)
     if not urls:
         on_progress("検索結果が見つかりませんでした。")
 
@@ -385,7 +440,7 @@ def scrape(
                         pass
 
                     try:
-                        matches = _extract_matches(page, keywords, cfg.max_snippet_chars)
+                        matches = _extract_matches(page, keywords_for_matching, cfg.max_snippet_chars)
                     except Exception as e:
                         on_progress(f"  -> 抽出失敗: {e}")
                         continue
@@ -399,8 +454,14 @@ def scrape(
                         if dedupe_key in seen_texts:
                             continue
                         seen_texts.add(dedupe_key)
+                        # 翻訳したキーワード（他言語）が一致した場合も、表示上は
+                        # 常に元のキーワードにまとめる（結果やサマリーが言語ごとに
+                        # 分散してしまわないようにするため）。
+                        matched_keyword = ", ".join(dict.fromkeys(
+                            keyword_variants.get(k, k) for k in m["keyword"].split(", ")
+                        ))
                         results.append({
-                            "keyword": m["keyword"],
+                            "keyword": matched_keyword,
                             "text": m["text"],
                             "image_url": m.get("imageUrl", ""),
                             "video_url": m.get("videoUrl", ""),

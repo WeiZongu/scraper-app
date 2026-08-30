@@ -128,11 +128,17 @@ def build_app(page: ft.Page):
         expand=True,
         hint_text="例: 営業時間, 定休日, 住所",
     )
+    translate_languages_field = ft.TextField(
+        label="多言語で検索・抽出（オプション。翻訳先の言語コードをカンマ区切りで）",
+        expand=True,
+        hint_text="例: en, zh-TW　（空欄なら入力したキーワードのみで検索・抽出）",
+    )
     def load_into_form(cfg: SearchConfig):
         state["current_config_name"] = cfg.name
         name_field.value = cfg.name
         search_keyword_field.value = cfg.search_keyword
         extract_keywords_field.value = ", ".join(cfg.extract_keywords)
+        translate_languages_field.value = ", ".join(cfg.translate_languages)
         tabs.selected_index = 1  # 「検索設定」タブへ切り替え
         page.update()
 
@@ -141,14 +147,19 @@ def build_app(page: ft.Page):
         name_field.value = ""
         search_keyword_field.value = ""
         extract_keywords_field.value = ""
+        translate_languages_field.value = ""
         page.update()
 
     def build_config_from_form() -> SearchConfig:
         extract_keywords = [k.strip() for k in extract_keywords_field.value.split(",") if k.strip()]
+        translate_languages = [
+            lang.strip() for lang in translate_languages_field.value.split(",") if lang.strip()
+        ]
         return SearchConfig(
             name=name_field.value.strip(),
             search_keyword=search_keyword_field.value.strip(),
             extract_keywords=extract_keywords,
+            translate_languages=translate_languages,
         )
 
     def on_save(e):
@@ -272,6 +283,12 @@ def build_app(page: ft.Page):
         ft.ResponsiveRow([ft.Container(name_field, col=12)]),
         ft.ResponsiveRow([ft.Container(search_keyword_field, col=12)]),
         ft.ResponsiveRow([ft.Container(extract_keywords_field, col=12)]),
+        ft.ResponsiveRow([ft.Container(translate_languages_field, col=12)]),
+        ft.Text(
+            "※翻訳は無料サービスを利用しており、失敗した場合は入力したキーワードのみで動作します。"
+            "言語を増やすほど検索・処理に時間がかかります。",
+            size=11, color=ft.Colors.GREY,
+        ),
         ft.ElevatedButton("設定を保存", icon=ft.Icons.SAVE, on_click=on_save),
     ], expand=True, scroll=ft.ScrollMode.AUTO)
 
