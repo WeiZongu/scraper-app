@@ -42,6 +42,11 @@ SERPER_MAX_PAGES = 5
 # ページ内でキーワード一致を探す際の、抜粋として妥当とみなすテキスト長の範囲
 MIN_SNIPPET_CHARS = 8
 
+# 検索・抽出キーワードを常にこれらの言語にも翻訳し、多言語で検索・抽出する
+# （日本語(ja)以外のページも取りこぼさないようにするための固定リスト）。
+# 日本語自体への翻訳は自分自身への変換になり何も起きないため含めていない。
+TRANSLATE_LANGUAGES = ["en", "zh-TW", "zh-CN", "ko", "es"]
+
 
 class ScrapeError(Exception):
     pass
@@ -349,23 +354,16 @@ def scrape(
     if not keywords:
         raise ScrapeError("抽出キーワードを1つ以上入力してください。")
 
-    languages = [lang.strip() for lang in cfg.translate_languages if lang.strip()]
-
-    # 抽出キーワードを指定言語に翻訳し、元言語以外のページでも一致するようにする。
+    # 抽出キーワードを固定の対象言語に翻訳し、元言語以外のページでも一致するようにする。
     # マッチした結果はどの言語のキーワードで一致しても、常に元のキーワードで表示する。
-    keyword_variants: dict[str, str] = {}
-    keywords_for_matching = keywords
-    if languages:
-        on_progress(f"抽出キーワードを {', '.join(languages)} に翻訳しています…")
-        keyword_variants = _build_keyword_variants(keywords, languages, on_progress)
-        keywords_for_matching = list(keyword_variants.keys())
+    on_progress(f"抽出キーワードを {', '.join(TRANSLATE_LANGUAGES)} に翻訳しています…")
+    keyword_variants = _build_keyword_variants(keywords, TRANSLATE_LANGUAGES, on_progress)
+    keywords_for_matching = list(keyword_variants.keys())
 
     # 検索キーワードも同様に翻訳し、それぞれの言語で個別に検索してURLを集める
     # （検索エンジンは基本的に検索キーワードと同じ言語のページを優先的に返すため）。
-    search_keywords = [cfg.search_keyword]
-    if languages:
-        sk_variants = _build_keyword_variants([cfg.search_keyword], languages, on_progress)
-        search_keywords = list(sk_variants.keys())
+    sk_variants = _build_keyword_variants([cfg.search_keyword], TRANSLATE_LANGUAGES, on_progress)
+    search_keywords = list(sk_variants.keys())
 
     # 検索はAPI呼び出しのみでブラウザ不要なため、Playwright起動前に済ませる
     # （APIキー未設定などで早期に失敗する場合、ブラウザを起動する無駄を避けられる）。
