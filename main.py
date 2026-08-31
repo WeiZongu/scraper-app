@@ -130,9 +130,14 @@ def build_app(page: ft.Page):
     extract_fields_list = ft.Column([])
 
     def _make_extract_field_row(title_value: str = "", keyword_value: str = "") -> dict:
-        title_field = ft.TextField(label="抽出タイトル（表の列名）", value=title_value, expand=True, hint_text="例: 価格")
+        title_field = ft.TextField(
+            label="抽出タイトル（表の列名。自由な言葉でOK）",
+            value=title_value,
+            expand=True,
+            hint_text="例: 価格、出発日 など",
+        )
         keyword_field = ft.TextField(
-            label='抽出キーワード（"*"でワイルドカード可）',
+            label='抽出キーワード（ページ内でこの文字列と一致させる。"*"でワイルドカード可）',
             value=keyword_value,
             expand=True,
             hint_text="例: 価格 や 11/*",
