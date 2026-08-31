@@ -149,8 +149,11 @@ _EXTRACT_JS = """
 
     // 1. 各キーワードグループについて、一致する最も内側の要素を集める
     //    （グループ内のいずれかの表記＝元の言語 or 翻訳後の語、ワイルドカード込みで
-    //    一致すればよい）
+    //    一致すればよい）。AND条件で0件になった際の原因調査用に、キーワードごとの
+    //    単独一致件数（グループ化・AND条件は無視）も数えておく。
     const leafMatches = [];
+    const matchCounts = {};
+    for (const group of keywordGroups) matchCounts[group.original] = 0;
     for (const el of all) {
         if (skipTags.has(el.tagName)) continue;
         const text = (el.innerText || "").replace(/\\s+/g, " ").trim();
@@ -167,6 +170,7 @@ _EXTRACT_JS = """
                 }
             }
             if (hasMatchingChild) continue;
+            matchCounts[group.original]++;
             const snippet = text.length > maxLen ? text.slice(0, maxLen) + "…" : text;
             leafMatches.push({el: el, keyword: group.original, text: snippet});
         }
@@ -231,12 +235,16 @@ _EXTRACT_JS = """
 
         results.push({columns: columns, imageUrl: imageUrl, videoUrl: videoUrl});
     }
-    return results;
+    return {records: results, matchCounts: matchCounts};
 }
 """
 
 
-def _extract_matches(page: Page, keyword_groups: list[dict], max_snippet_chars: int) -> list[dict]:
+def _extract_matches(page: Page, keyword_groups: list[dict], max_snippet_chars: int) -> dict:
+    """{"records": [...AND条件を満たした行...], "matchCounts": {タイトル: 単独一致件数}} を返す。
+    matchCountsはAND条件・グルーピングを無視した単独一致件数で、0件になった際に
+    どのキーワードがボトルネックかを調べるための診断用データ。
+    """
     return page.evaluate(
         _EXTRACT_JS,
         {"keywordGroups": keyword_groups, "minLen": MIN_SNIPPET_CHARS, "maxLen": max_snippet_chars},
@@ -413,6 +421,11 @@ def scrape(
 
     results: list[dict] = []
     seen_signatures: set[tuple[str, ...]] = set()
+    # 最終的に0件だった場合に「AND条件のうちどのキーワードがボトルネックか」を
+    # 診断できるよう、AND条件・ページをまたいだグルーピングを無視した
+    # キーワード単独の一致件数（全ページ合計）を集計しておく。
+    total_match_counts: dict[str, int] = {t: 0 for t in column_titles}
+    pages_processed = 0
 
     with sync_playwright() as p:
         def launch():
@@ -472,13 +485,17 @@ def scrape(
                         pass
 
                     try:
-                        matches = _extract_matches(page, keyword_groups, cfg.max_snippet_chars)
+                        extraction = _extract_matches(page, keyword_groups, cfg.max_snippet_chars)
                     except Exception as e:
                         on_progress(f"  -> 抽出失敗: {e}")
                         continue
 
+                    pages_processed += 1
+                    for t, count in extraction.get("matchCounts", {}).items():
+                        total_match_counts[t] = total_match_counts.get(t, 0) + count
+
                     added = 0
-                    for m in matches:
+                    for m in extraction.get("records", []):
                         columns = {t: m["columns"].get(t, "") for t in column_titles}
                         # サイト内の別ページに同じレコード（フッターの住所など）が
                         # 繰り返し出てくることがあるため、全列の内容だけで
@@ -505,6 +522,23 @@ def scrape(
             browser.close()
 
     results = _consolidate_near_duplicates(results, column_titles, on_progress)
+
+    if not results and pages_processed:
+        # 0件だった場合、AND条件のどのキーワードがボトルネックかを推測できるよう、
+        # キーワード単独の一致件数（AND条件・ページ横断のグルーピングは無視）を表示する。
+        # 0件のキーワードがあれば、それがページ内に存在しない/表記が違う可能性が高い。
+        # 逆にすべて1件以上あるのにAND条件で0件なら、各キーワードが同じ場所に
+        # まとまっていない（抽出項目を絞る、表記を見直す等が有効）と考えられる。
+        breakdown = "、".join(f"{t}: {c}件" for t, c in total_match_counts.items())
+        on_progress(
+            "  -> 0件でした。参考: 各抽出項目が単独で（AND条件を無視して）"
+            f"何回見つかったか — {breakdown}"
+        )
+        on_progress(
+            "  -> 0件のキーワードは、そのページに存在しない/表記が違う可能性があります。"
+            "すべて1件以上あるのにAND条件で0件の場合は、各キーワードが同じ箇所に"
+            "まとまっていないため、抽出項目を絞るか表記を調整すると改善する場合があります。"
+        )
 
     on_progress(f"完了: 合計 {len(results)} 件取得しました。")
     return results
