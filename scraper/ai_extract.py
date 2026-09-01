@@ -19,7 +19,9 @@ import requests
 ProgressCallback = Callable[[str], None]
 
 GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-GEMINI_MODEL = "gemini-2.0-flash"
+# Geminiのモデルは廃止・置き換えが行われることがあるため、コードを直さず
+# 環境変数 GEMINI_MODEL で上書きできるようにしておく。
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.6-flash").strip()
 # 無料枠のトークン数を抑えるため、ページテキストはこの文字数までしか渡さない。
 MAX_PAGE_TEXT_CHARS = 15000
 REQUEST_TIMEOUT_SEC = 30
@@ -122,6 +124,12 @@ def extract_records(
         raise AiExtractError("Gemini APIのレート制限（無料枠の上限）に達しました。しばらく待ってから再実行してください。")
     if resp.status_code in (400, 401, 403):
         raise AiExtractError(f"Gemini APIキーが無効か、リクエストが拒否されました（status={resp.status_code}）: {resp.text[:200]}")
+    if resp.status_code == 404:
+        raise AiExtractError(
+            f"Gemini APIのモデル「{GEMINI_MODEL}」が見つかりません（廃止された可能性が"
+            f"あります）。環境変数 GEMINI_MODEL で利用可能なモデル名に変更してください: "
+            f"{resp.text[:200]}"
+        )
     if resp.status_code != 200:
         raise AiExtractError(f"Gemini APIエラー（status={resp.status_code}）: {resp.text[:300]}")
 
