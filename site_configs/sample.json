@@ -2,8 +2,7 @@
   "name": "サンプル(書籍情報を探す)",
   "search_keyword": "books.toscrape.com",
   "extract_fields": [
-    {"title": "価格", "keyword": "£"},
-    {"title": "在庫", "keyword": "In stock"}
-  ],
-  "max_snippet_chars": 400
+    {"title": "価格", "keyword": "書籍の価格"},
+    {"title": "在庫", "keyword": "在庫状況（在庫あり/在庫切れなど）"}
+  ]
 }

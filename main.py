@@ -2,7 +2,7 @@
 キーワードだけで使えるWeb検索・抽出GUIアプリ（Flet製）
 
 - CSSセレクタの指定は不要。検索キーワードでWebを検索し、
-  各ページの中から抽出キーワードを含むテキストの塊をまるごと拾う。
+  各ページのテキストからAI（Gemini API）が抽出項目に沿ったレコードを抜き出す。
 - Playwrightで動的コンテンツ(JS描画)にも対応
 - 結果をプレビュー後、1件1スライドの要約されたPowerPointスライドとして出力
 """
@@ -163,10 +163,10 @@ def build_app(page: ft.Page):
             hint_text="例: 価格、出発日 など",
         )
         keyword_field = ft.TextField(
-            label='抽出キーワード（ページ内でこの文字列と一致させる。"*"でワイルドカード可）',
+            label="抽出キーワード（AIに何を探すか伝える説明。自然言語でOK）",
             value=keyword_value,
             expand=True,
-            hint_text="例: 価格 や 11/*",
+            hint_text='例: 価格 や 出発日。"*"のみで列名から連想して自由に抽出',
         )
         row_state: dict = {"title_field": title_field, "keyword_field": keyword_field}
 
@@ -433,9 +433,11 @@ def build_app(page: ft.Page):
         extract_fields_list,
         add_extract_field_button,
         ft.Text(
-            "※検索・抽出キーワードは常に日本語・英語・中国語(繁体字/簡体字)・韓国語・"
-            "スペイン語に自動翻訳して多言語で検索・抽出します（翻訳は無料サービスを"
-            "利用しており、失敗した場合は入力したキーワードのみで動作します）。",
+            "※検索キーワードは常に日本語・英語・中国語(繁体字/簡体字)・韓国語・"
+            "スペイン語に自動翻訳して多言語で検索します（翻訳は無料サービスを"
+            "利用しており、失敗した場合は入力したキーワードのみで動作します）。"
+            "抽出キーワードはAI（Gemini）に渡され、AIが多言語のページでも"
+            "内容を理解して抽出するため翻訳は不要です。",
             size=11, color=ft.Colors.GREY,
         ),
         ft.ElevatedButton("設定を保存", icon=ft.Icons.SAVE, on_click=on_save),

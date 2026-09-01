@@ -17,8 +17,9 @@ CONFIG_DIR.mkdir(exist_ok=True)
 class ExtractField:
     """1つの抽出項目（＝結果の表の1列）。
     title: 表の列名として表示される名前（例: "価格"）。
-    keyword: ページ内で実際に探すキーワード。"*" をワイルドカードとして使える
-             （例: "11/*" は "11/15" 等にマッチする）。
+    keyword: AI（Gemini）にその列で何を探すか伝える説明（自然言語のヒント）。
+             例: "価格" や "出発日"。"*" のみの場合は列名から連想される情報を
+             自由に埋めるようAIに指示する。
     """
     title: str
     keyword: str
@@ -37,14 +38,12 @@ class SearchConfig:
     name: str
     search_keyword: str                        # Web検索にかけるキーワード
     extract_fields: list[ExtractField] = field(default_factory=list)  # 抽出項目（列）
-    max_snippet_chars: int = 400                # 抜粋テキストの最大文字数
 
     def to_dict(self) -> dict:
         return {
             "name": self.name,
             "search_keyword": self.search_keyword,
             "extract_fields": [f.to_dict() for f in self.extract_fields],
-            "max_snippet_chars": self.max_snippet_chars,
         }
 
     @staticmethod
@@ -59,7 +58,6 @@ class SearchConfig:
             name=d["name"],
             search_keyword=d.get("search_keyword", ""),
             extract_fields=extract_fields,
-            max_snippet_chars=d.get("max_snippet_chars", 400),
         )
 
 
