@@ -66,6 +66,9 @@ def build_app(page: ft.Page):
                     ),
                 )
             )
+        # 保存・削除・復元のたびにバックアップファイルも自動で最新化しておく
+        # （手動バックアップを忘れてもダウンロードリンクは常に最新の状態になる）。
+        do_backup(None, announce=False)
         page.update()
 
     # ---------------- 設定のバックアップ／復元（クラウドの再起動でデータが消えても復旧できるように） ----------------
@@ -73,7 +76,7 @@ def build_app(page: ft.Page):
     DOWNLOADS_DIR.mkdir(parents=True, exist_ok=True)
     backup_link = ft.Row([])
 
-    def do_backup(e):
+    def do_backup(e, announce: bool = True):
         import json
         configs = [c.to_dict() for c in list_configs()]
         backup_path = DOWNLOADS_DIR / "site_configs_backup.json"
@@ -85,8 +88,9 @@ def build_app(page: ft.Page):
                 on_click=lambda e: None,
             )
         ]
-        status_text.value = f"{len(configs)}件の検索設定をバックアップファイルにまとめました。下のリンクからダウンロードしてください。"
-        page.update()
+        if announce:
+            status_text.value = f"{len(configs)}件の検索設定をバックアップファイルにまとめました。下のリンクからダウンロードしてください。"
+            page.update()
 
     file_picker = ft.FilePicker()
     page.services.append(file_picker)
@@ -219,8 +223,11 @@ def build_app(page: ft.Page):
             return
         cfg = build_config_from_form()
         save_config(cfg)
-        status_text.value = f"「{cfg.name}」の設定を保存しました。"
         refresh_site_list()
+        status_text.value = (
+            f"「{cfg.name}」の設定を保存しました（バックアップも自動更新済み。"
+            "「検索設定一覧」タブのリンクからダウンロードできます）。"
+        )
         page.update()
 
     # ---------------- 実行セクション ----------------
