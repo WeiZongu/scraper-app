@@ -11,6 +11,7 @@ from __future__ import annotations
 import logging
 import os
 import threading
+import time
 import traceback
 from datetime import datetime
 from pathlib import Path
@@ -37,6 +38,27 @@ APP_PASSWORD = os.environ.get("APP_PASSWORD", "")  # 空文字なら認証なし
 # 固定の末尾列だけをここで定義する（先頭にキーワード列が動的に追加される）。
 PREVIEW_TRAILING_LABELS = ["ページタイトル", "URL", "取得日時"]
 
+# 実行中のジョブ(検索/スライド出力)の状態を、特定のページ(ブラウザ接続)に
+# 紐づかない形でプロセス全体で共有しておく。スマホの画面をオフにする等で
+# 元のページとの接続が切れても、この状態を見れば処理自体は最後まで走って
+# いる/いたことが分かり、後で開き直したときに結果を復元できる。
+_job_lock = threading.Lock()
+_job_state: dict = {
+    "kind": None,  # "scrape" | "export" | None
+    "running": False,
+    "log_lines": [],
+    "last_cfg": None,
+    "last_rows": [],
+    "status": "",
+    "export_filename": None,
+}
+
+
+def _job_log(msg: str) -> None:
+    logger.info(msg)
+    with _job_lock:
+        _job_state["log_lines"].append(msg)
+
 
 def build_app(page: ft.Page):
     page.title = "キーワード検索・抽出ツール"
@@ -45,7 +67,7 @@ def build_app(page: ft.Page):
     page.padding = 10
     page.scroll = ft.ScrollMode.AUTO
 
-    state = {"current_config_name": None, "last_rows": []}
+    state = {"current_config_name": None}
 
     # ---------------- 左: 検索設定一覧 ----------------
     site_list = ft.ListView(expand=True, spacing=4)
@@ -240,10 +262,19 @@ def build_app(page: ft.Page):
 
     log_view = ft.ListView(height=180, spacing=2, auto_scroll=True)
 
+    def _safe_update():
+        # 画面(WebSocket接続)がすでに切れている場合、page.update()は例外を
+        # 送出することがある。バックグラウンドスレッドの処理自体はそれとは
+        # 独立して最後まで継続させたいため、ここで例外を握りつぶす。
+        try:
+            page.update()
+        except Exception:
+            pass
+
     def log(msg: str):
-        logger.info(msg)
+        _job_log(msg)
         log_view.controls.append(ft.Text(msg, size=11, font_family="monospace"))
-        page.update()
+        _safe_update()
 
     preview_table = ft.DataTable(columns=[ft.DataColumn(ft.Text(""))], rows=[])
     preview_container = ft.Column([preview_table], scroll=ft.ScrollMode.AUTO)
@@ -265,7 +296,7 @@ def build_app(page: ft.Page):
             ))
             for r in rows[:200]  # プレビューは最大200件
         ]
-        page.update()
+        _safe_update()
 
     def do_run(e):
         cfg = build_config_from_form()
@@ -278,8 +309,11 @@ def build_app(page: ft.Page):
         export_button.disabled = True
         progress_ring.visible = True
         log_view.controls.clear()
-        status_text.value = "実行中..."
+        status_text.value = "実行中...（画面をオフにしたりアプリを閉じても、サーバー側で処理は継続します）"
         page.update()
+
+        with _job_lock:
+            _job_state.update(kind="scrape", running=True, log_lines=[], last_cfg=cfg, status="実行中")
 
         def worker():
             try:
@@ -288,40 +322,47 @@ def build_app(page: ft.Page):
                     on_progress=log,
                     headless=True,
                 )
-                state["last_rows"] = rows
-                state["last_cfg"] = cfg
+                with _job_lock:
+                    _job_state["last_rows"] = rows
+                    _job_state["status"] = f"完了: {len(rows)} 件取得しました。"
                 render_preview(cfg, rows)
                 status_text.value = f"完了: {len(rows)} 件取得しました。"
                 export_button.disabled = len(rows) == 0
             except Exception as ex:
-                status_text.value = f"エラーが発生しました: {ex}"
+                error_msg = f"エラーが発生しました: {ex}"
+                with _job_lock:
+                    _job_state["status"] = error_msg
+                status_text.value = error_msg
                 # 画面には要点だけ、サーバー側のログには完全なトレースバックを残す
                 logger.exception("scrape() failed")
                 log_view.controls.append(
                     ft.Text("\n".join(traceback.format_exc().splitlines()[-5:]), size=11, font_family="monospace")
                 )
-                page.update()
+                _safe_update()
             finally:
+                with _job_lock:
+                    _job_state["running"] = False
                 run_button.disabled = False
                 progress_ring.visible = False
-                page.update()
+                _safe_update()
 
         threading.Thread(target=worker, daemon=True).start()
 
     export_link = ft.Row([])
 
     def do_export(e):
-        cfg = state.get("last_cfg")
-        rows = state.get("last_rows", [])
+        with _job_lock:
+            cfg = _job_state.get("last_cfg")
+            rows = list(_job_state.get("last_rows", []))
         if not cfg or not rows:
             status_text.value = "先にデータを取得してください。"
             page.update()
             return
 
         def export_progress(msg: str):
-            logger.info(msg)
+            _job_log(msg)
             export_status_text.value = msg
-            page.update()
+            _safe_update()
 
         filename = f"{cfg.name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pptx"
         out_path = OUTPUT_DIR / filename
@@ -330,29 +371,40 @@ def build_app(page: ft.Page):
         run_button.disabled = True
         export_progress_bar.visible = True
         export_status_text.visible = True
-        export_status_text.value = "スライド出力を開始します…"
+        export_status_text.value = "スライド出力を開始します…（画面をオフにしても処理は継続します）"
         status_text.value = ""
         export_link.controls = []
         page.update()
+
+        with _job_lock:
+            _job_state.update(kind="export", running=True, log_lines=[], export_filename=None, status="出力中")
 
         def worker():
             try:
                 logger.info("スライド出力を開始します: %s（%d件）", filename, len(rows))
                 export_report(cfg, rows, out_path, on_progress=export_progress)
                 logger.info("スライド出力が完了しました: %s", filename)
+                with _job_lock:
+                    _job_state["export_filename"] = filename
+                    _job_state["status"] = "スライドを出力しました。"
                 status_text.value = "スライドを出力しました。下のリンクからダウンロードしてください。"
                 export_link.controls = [
                     ft.TextButton(f"↓ {filename} をダウンロード", url=f"/output/{filename}")
                 ]
             except Exception as ex:
                 logger.exception("export_report() failed")
-                status_text.value = f"スライド出力エラー: {ex}"
+                error_msg = f"スライド出力エラー: {ex}"
+                with _job_lock:
+                    _job_state["status"] = error_msg
+                status_text.value = error_msg
             finally:
+                with _job_lock:
+                    _job_state["running"] = False
                 export_button.disabled = False
                 run_button.disabled = False
                 export_progress_bar.visible = False
                 export_status_text.visible = False
-                page.update()
+                _safe_update()
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -432,6 +484,96 @@ def build_app(page: ft.Page):
     page.add(tabs)
 
     refresh_site_list()
+
+    def _resume_job_ui():
+        """このページ（ブラウザ接続）が新規に開かれた/再接続されたときに、
+        すでに実行中または直近に完了したジョブがあればその状態を復元する。
+        スマホの画面をオフにする・アプリを閉じる等で元の接続が切れても、
+        サーバー側のバックグラウンドスレッドでは処理が最後まで継続しており、
+        再度開いたときにその結果（または途中経過）を確認できるようにする。
+        """
+        with _job_lock:
+            running = _job_state["running"]
+            kind = _job_state["kind"]
+            log_lines = list(_job_state["log_lines"])
+            last_cfg = _job_state["last_cfg"]
+            last_rows = list(_job_state["last_rows"])
+            export_filename = _job_state["export_filename"]
+            status = _job_state["status"]
+
+        if kind is None:
+            return  # このサーバープロセスではまだ何も実行されていない
+
+        log_view.controls.clear()
+        log_view.controls.extend(ft.Text(line, size=11, font_family="monospace") for line in log_lines)
+
+        if last_cfg and last_rows:
+            render_preview(last_cfg, last_rows)
+        export_button.disabled = not last_rows
+        if export_filename:
+            export_link.controls = [
+                ft.TextButton(f"↓ {export_filename} をダウンロード", url=f"/output/{export_filename}")
+            ]
+        status_text.value = status
+
+        if running:
+            run_button.disabled = True
+            export_button.disabled = True
+            if kind == "scrape":
+                progress_ring.visible = True
+            else:
+                export_progress_bar.visible = True
+                export_status_text.visible = True
+                export_status_text.value = log_lines[-1] if log_lines else "処理中…"
+
+        _safe_update()
+
+        if not running:
+            return
+
+        def watcher():
+            # 実行中のジョブが完了する（または新しいログが増える）たびに、
+            # このページの表示を追いかけて更新し続ける。
+            last_seen = len(log_lines)
+            while True:
+                time.sleep(1)
+                with _job_lock:
+                    current_lines = list(_job_state["log_lines"])
+                    still_running = _job_state["running"]
+                if len(current_lines) > last_seen:
+                    for line in current_lines[last_seen:]:
+                        log_view.controls.append(ft.Text(line, size=11, font_family="monospace"))
+                        if kind == "export":
+                            export_status_text.value = line
+                    last_seen = len(current_lines)
+                    _safe_update()
+                if not still_running:
+                    with _job_lock:
+                        final_cfg = _job_state["last_cfg"]
+                        final_rows = list(_job_state["last_rows"])
+                        final_export_filename = _job_state["export_filename"]
+                        final_status = _job_state["status"]
+                    if final_cfg and final_rows:
+                        render_preview(final_cfg, final_rows)
+                    export_button.disabled = not final_rows
+                    if final_export_filename:
+                        export_link.controls = [
+                            ft.TextButton(
+                                f"↓ {final_export_filename} をダウンロード",
+                                url=f"/output/{final_export_filename}",
+                            )
+                        ]
+                    run_button.disabled = False
+                    progress_ring.visible = False
+                    export_progress_bar.visible = False
+                    export_status_text.visible = False
+                    status_text.value = final_status
+                    _safe_update()
+                    break
+
+        threading.Thread(target=watcher, daemon=True).start()
+
+    _resume_job_ui()
 
 
 def main(page: ft.Page):
