@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from typing import Callable
 
 import requests
@@ -25,6 +26,11 @@ GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.6-flash").strip()
 # 無料枠のトークン数を抑えるため、ページテキストはこの文字数までしか渡さない。
 MAX_PAGE_TEXT_CHARS = 15000
 REQUEST_TIMEOUT_SEC = 30
+
+# 無料枠は混雑時に503(高負荷)・429(レート制限)を返すことがあるが、多くは
+# 数秒〜十数秒待てば解消する一時的なものなので、諦める前に自動で再試行する。
+RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+RETRY_BACKOFF_SEC = [5, 15, 30]
 
 
 class AiExtractError(Exception):
@@ -115,10 +121,17 @@ def extract_records(
         },
     }
 
-    try:
-        resp = requests.post(url, params={"key": api_key}, json=body, timeout=REQUEST_TIMEOUT_SEC)
-    except requests.RequestException as e:
-        raise AiExtractError(f"Gemini APIへの接続に失敗しました: {e}") from e
+    resp = None
+    for attempt, wait_sec in enumerate([0] + RETRY_BACKOFF_SEC):
+        if wait_sec:
+            on_progress(f"  -> Gemini APIが混雑/制限中のため{wait_sec}秒後に再試行します（{attempt}/{len(RETRY_BACKOFF_SEC)}）")
+            time.sleep(wait_sec)
+        try:
+            resp = requests.post(url, params={"key": api_key}, json=body, timeout=REQUEST_TIMEOUT_SEC)
+        except requests.RequestException as e:
+            raise AiExtractError(f"Gemini APIへの接続に失敗しました: {e}") from e
+        if resp.status_code not in RETRYABLE_STATUS_CODES:
+            break
 
     if resp.status_code == 429:
         raise AiExtractError("Gemini APIのレート制限（無料枠の上限）に達しました。しばらく待ってから再実行してください。")
