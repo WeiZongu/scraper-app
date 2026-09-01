@@ -234,6 +234,8 @@ def build_app(page: ft.Page):
     run_button = ft.ElevatedButton("実行", icon=ft.Icons.PLAY_ARROW)
     export_button = ft.ElevatedButton("スライド出力(PowerPoint)", icon=ft.Icons.SLIDESHOW, disabled=True)
     progress_ring = ft.ProgressRing(visible=False, width=20, height=20)
+    export_progress_bar = ft.ProgressBar(visible=False)
+    export_status_text = ft.Text("", size=11, color=ft.Colors.GREY, visible=False)
     status_text = ft.Text("", color=ft.Colors.BLUE_GREY)
 
     log_view = ft.ListView(height=180, spacing=2, auto_scroll=True)
@@ -315,20 +317,44 @@ def build_app(page: ft.Page):
             status_text.value = "先にデータを取得してください。"
             page.update()
             return
+
+        def export_progress(msg: str):
+            logger.info(msg)
+            export_status_text.value = msg
+            page.update()
+
         filename = f"{cfg.name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pptx"
         out_path = OUTPUT_DIR / filename
-        logger.info("スライド出力を開始します: %s（%d件）", filename, len(rows))
-        try:
-            export_report(cfg, rows, out_path)
-            logger.info("スライド出力が完了しました: %s", filename)
-            status_text.value = "スライドを出力しました。下のリンクからダウンロードしてください。"
-            export_link.controls = [
-                ft.TextButton(f"↓ {filename} をダウンロード", url=f"/output/{filename}")
-            ]
-        except Exception as ex:
-            logger.exception("export_report() failed")
-            status_text.value = f"スライド出力エラー: {ex}"
+
+        export_button.disabled = True
+        run_button.disabled = True
+        export_progress_bar.visible = True
+        export_status_text.visible = True
+        export_status_text.value = "スライド出力を開始します…"
+        status_text.value = ""
+        export_link.controls = []
         page.update()
+
+        def worker():
+            try:
+                logger.info("スライド出力を開始します: %s（%d件）", filename, len(rows))
+                export_report(cfg, rows, out_path, on_progress=export_progress)
+                logger.info("スライド出力が完了しました: %s", filename)
+                status_text.value = "スライドを出力しました。下のリンクからダウンロードしてください。"
+                export_link.controls = [
+                    ft.TextButton(f"↓ {filename} をダウンロード", url=f"/output/{filename}")
+                ]
+            except Exception as ex:
+                logger.exception("export_report() failed")
+                status_text.value = f"スライド出力エラー: {ex}"
+            finally:
+                export_button.disabled = False
+                run_button.disabled = False
+                export_progress_bar.visible = False
+                export_status_text.visible = False
+                page.update()
+
+        threading.Thread(target=worker, daemon=True).start()
 
     run_button.on_click = do_run
     export_button.on_click = do_export
@@ -367,6 +393,8 @@ def build_app(page: ft.Page):
         ft.Text("実行", weight=ft.FontWeight.BOLD, size=16),
         ft.Text("※実行する設定は「検索設定」タブで選択・保存したものが対象です", size=11, color=ft.Colors.GREY),
         ft.Row([run_button, progress_ring, export_button], wrap=True),
+        export_progress_bar,
+        export_status_text,
         export_link,
         status_text,
         ft.Text("実行ログ", size=12, color=ft.Colors.GREY),

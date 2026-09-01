@@ -10,10 +10,12 @@
 """
 from __future__ import annotations
 
+import re
 import urllib.request
 from datetime import datetime
 from io import BytesIO
 from pathlib import Path
+from typing import Callable
 
 from PIL import Image, ImageFilter, ImageOps
 from pptx import Presentation
@@ -42,6 +44,26 @@ PLAIN_BG_COLOR = RGBColor(0xFA, 0xFB, 0xFD)  # 画像が無いページの背景
 ROWS_PER_SLIDE = 5  # 1ページあたりの表示行数（ヘッダー行は別）
 DOWNLOAD_TIMEOUT_SEC = 8
 MAX_IMAGE_DIMENSION = 1280  # スケルトン加工前に縮小する上限(px)。メモリ節約のため
+
+# 進捗通知用コールバックの型: (message: str) -> None
+ProgressCallback = Callable[[str], None]
+
+
+def _noop(_msg: str) -> None:
+    pass
+
+
+# XML 1.0で許可されていない制御文字（NULLや一部の制御コード等）。
+# スクレイピングしたWebページのテキストにはこれらが紛れ込むことがあり、
+# 含んだまま書き出すと生成される.pptxのXMLが不正になる。デスクトップ版の
+# PowerPointは寛容に解釈して開けてしまうことが多いが、iOS側のOfficeファイル
+# インポーターは厳格にエラー（例: OfficeImportErrorDomain エラー912）にする
+# ことがあるため、書き出し前に必ず取り除く。
+_ILLEGAL_XML_CHARS_RE = re.compile("[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
+
+def _safe_text(text: str) -> str:
+    return _ILLEGAL_XML_CHARS_RE.sub("", text or "")
 
 
 def _set_transparency(fill, alpha_pct: int) -> None:
@@ -192,7 +214,7 @@ def _add_title_slide(prs: Presentation, cfg: SearchConfig, rows: list[dict]) -> 
     title_box = slide.shapes.add_textbox(Inches(1), Inches(2.6), SLIDE_WIDTH - Inches(2), Inches(1.5))
     tf = title_box.text_frame
     tf.word_wrap = True
-    tf.text = cfg.name or "検索結果"
+    tf.text = _safe_text(cfg.name) or "検索結果"
     p = tf.paragraphs[0]
     p.alignment = PP_ALIGN.CENTER
     p.font.size = Pt(40)
@@ -203,8 +225,8 @@ def _add_title_slide(prs: Presentation, cfg: SearchConfig, rows: list[dict]) -> 
     tf = info_box.text_frame
     tf.word_wrap = True
     lines = [
-        f"検索キーワード: {cfg.search_keyword}",
-        f"抽出キーワード（列）: {', '.join(_column_titles(cfg))}",
+        f"検索キーワード: {_safe_text(cfg.search_keyword)}",
+        f"抽出キーワード（列）: {', '.join(_safe_text(t) for t in _column_titles(cfg))}",
         f"件数: {len(rows)}件　|　作成日時: {datetime.now().strftime('%Y-%m-%d %H:%M')}",
     ]
     for i, line in enumerate(lines):
@@ -220,7 +242,7 @@ def _set_cell_text(cell, text: str, *, size: int, color: RGBColor, bold: bool = 
     tf = cell.text_frame
     tf.word_wrap = True
     tf.vertical_anchor = MSO_ANCHOR.TOP
-    tf.text = text
+    tf.text = _safe_text(text)
     p = tf.paragraphs[0]
     p.font.size = Pt(size)
     p.font.bold = bold
@@ -228,6 +250,11 @@ def _set_cell_text(cell, text: str, *, size: int, color: RGBColor, bold: bool = 
 
 
 def _add_source_cell(cell, title: str, url: str, video_url: str, fetched_at: str) -> None:
+    title = _safe_text(title)
+    url = _safe_text(url)
+    video_url = _safe_text(video_url)
+    fetched_at = _safe_text(fetched_at)
+
     tf = cell.text_frame
     tf.word_wrap = True
     tf.vertical_anchor = MSO_ANCHOR.TOP
@@ -286,7 +313,7 @@ def _add_table_slide(
 
     title_box = slide.shapes.add_textbox(Inches(0.5), Inches(0.25), Inches(10), Inches(0.6))
     tf = title_box.text_frame
-    tf.text = cfg.name or "検索結果"
+    tf.text = _safe_text(cfg.name) or "検索結果"
     tf.paragraphs[0].font.size = Pt(20)
     tf.paragraphs[0].font.bold = True
     tf.paragraphs[0].font.color.rgb = title_color
@@ -385,25 +412,35 @@ def _group_into_pages(rows: list[dict], rows_per_page: int) -> list[list[dict]]:
     return pages
 
 
-def export_report(cfg: SearchConfig, rows: list[dict], output_path: Path) -> Path:
+def export_report(
+    cfg: SearchConfig,
+    rows: list[dict],
+    output_path: Path,
+    on_progress: ProgressCallback = _noop,
+) -> Path:
     """
     rows: engine.scrape() が返す辞書のリスト
           （columns: {キーワード: 値, ...} / image_url / video_url / title / url /
           fetched_at の各キーを持つ）
     表紙 → 表スライド（1ページ ROWS_PER_SLIDE 行、同じ出典ページの行はなるべく
-    同じスライドにまとめる）の順に構成する。
+    同じスライドにまとめる）の順に構成する。画像のダウンロード・加工が入るため
+    件数によっては時間がかかる。on_progress でスライドごとの進捗を通知する。
     """
     prs = Presentation()
     prs.slide_width = SLIDE_WIDTH
     prs.slide_height = SLIDE_HEIGHT
 
+    on_progress("表紙スライドを作成中…")
     _add_title_slide(prs, cfg, rows)
 
     pages = _group_into_pages(rows, ROWS_PER_SLIDE)
     total_pages = max(1, len(pages))
     for page_num, chunk in enumerate(pages, start=1):
+        on_progress(f"表スライドを作成中… ({page_num}/{total_pages}ページ目、背景画像を処理中)")
         _add_table_slide(prs, cfg, chunk, page_num, total_pages)
 
+    on_progress("ファイルに保存中…")
     output_path.parent.mkdir(parents=True, exist_ok=True)
     prs.save(output_path)
+    on_progress("完了しました。")
     return output_path
