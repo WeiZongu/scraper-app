@@ -1,10 +1,11 @@
 """
-検索キーワードからWebを検索し、各ページのDOM内から抽出項目（列）が
-すべてそろっている(AND条件)「1件のレコード」を行データとして抜き出すエンジン。
+検索キーワードからWebを検索し、各ページのDOM内から抽出項目（列）のいずれか
+1つでも見つかった(OR条件)「1件のレコード」を行データとして抜き出すエンジン。
 CSSセレクタの指定なしで使えるように、要素の特定はキーワード一致で行う。
 各抽出項目は「タイトル（表の列名）」と「キーワード（実際に探すパターン、
 "*" によるワイルドカード可）」の組で、抽出項目がそのまま表の列になり、
-各行はタイトルごとの値（該当箇所の文・段落）を持つ key:value の組み合わせになる。
+各行はタイトルごとの値（該当箇所の文・段落。一致しなかった列は空欄）を持つ
+key:value の組み合わせになる。
 
 Web検索には Serper.dev の Search API を使う（検索エンジンのHTMLページを直接
 スクレイピングする方式は、bot検知やHTML構造の変化・クラウドIPのブロックなどで
@@ -129,8 +130,8 @@ def _serper_search_urls(keyword: str, on_progress: ProgressCallback) -> list[str
 #    ついて、一致する最も内側の要素（1文・1段落程度）を見つける。
 # 2. そこから親要素を1階層たどって「1件分の情報」とみなせる範囲（レコード）を求め、
 #    同じ範囲に属する各キーワードの一致テキストをまとめる。
-# 3. 全キーワードがそろった（AND条件）レコードだけを結果として返す。
-#    1つでも欠けているキーワードがあるレコードは除外する。
+# 3. いずれか1つでもキーワードが見つかったレコードを結果として返す（OR条件）。
+#    一致しなかった列は空欄になる。
 _EXTRACT_JS = """
 (args) => {
     const keywordGroups = args.keywordGroups; // [{original, variants: [...]}, ...]
@@ -149,8 +150,8 @@ _EXTRACT_JS = """
 
     // 1. 各キーワードグループについて、一致する最も内側の要素を集める
     //    （グループ内のいずれかの表記＝元の言語 or 翻訳後の語、ワイルドカード込みで
-    //    一致すればよい）。AND条件で0件になった際の原因調査用に、キーワードごとの
-    //    単独一致件数（グループ化・AND条件は無視）も数えておく。
+    //    一致すればよい）。0件になった際の原因調査用に、キーワードごとの
+    //    単独一致件数（グループ化は無視）も数えておく。
     const leafMatches = [];
     const matchCounts = {};
     for (const group of keywordGroups) matchCounts[group.original] = 0;
@@ -198,13 +199,12 @@ _EXTRACT_JS = """
         }
     }
 
-    // 3. 全キーワードがそろっている（AND条件）レコードのみ、画像・動画を付けて
-    //    結果を組み立てる（内容が完全に同じレコードは重複排除する）
+    // 3. いずれか1つでもキーワードが見つかったレコードを結果とする（OR条件）。
+    //    一致しなかった列は空欄になる。画像・動画も付けて結果を組み立て、
+    //    内容が完全に同じレコードは重複排除する。
     const seenSignature = new Set();
     const results = [];
     for (const [container, values] of records.entries()) {
-        if (values.size < keywordGroups.length) continue; // 1つでも欠けていたら除外
-
         const columns = {};
         for (const group of keywordGroups) columns[group.original] = values.get(group.original) || "";
 
@@ -241,9 +241,9 @@ _EXTRACT_JS = """
 
 
 def _extract_matches(page: Page, keyword_groups: list[dict], max_snippet_chars: int) -> dict:
-    """{"records": [...AND条件を満たした行...], "matchCounts": {タイトル: 単独一致件数}} を返す。
-    matchCountsはAND条件・グルーピングを無視した単独一致件数で、0件になった際に
-    どのキーワードがボトルネックかを調べるための診断用データ。
+    """{"records": [...OR条件で見つかった行...], "matchCounts": {タイトル: 単独一致件数}} を返す。
+    matchCountsはグルーピングを無視した単独一致件数で、0件になった際にどの
+    キーワードが原因かを調べるための診断用データ。
     """
     return page.evaluate(
         _EXTRACT_JS,
@@ -382,8 +382,9 @@ def scrape(
     headless: bool = True,
 ) -> list[dict]:
     """
-    検索キーワードでWebを検索し、上位ページを開いて抽出項目（列）が
-    すべてそろっているレコードを集める。行データのリストを返す。
+    検索キーワードでWebを検索し、上位ページを開いて抽出項目（列）のいずれか
+    1つでも見つかったレコードを集める（OR条件。一致しなかった列は空欄になる）。
+    行データのリストを返す。
     """
     fields = [
         (f.title.strip() or f.keyword.strip(), f.keyword.strip())
@@ -524,20 +525,15 @@ def scrape(
     results = _consolidate_near_duplicates(results, column_titles, on_progress)
 
     if not results and pages_processed:
-        # 0件だった場合、AND条件のどのキーワードがボトルネックかを推測できるよう、
-        # キーワード単独の一致件数（AND条件・ページ横断のグルーピングは無視）を表示する。
-        # 0件のキーワードがあれば、それがページ内に存在しない/表記が違う可能性が高い。
-        # 逆にすべて1件以上あるのにAND条件で0件なら、各キーワードが同じ場所に
-        # まとまっていない（抽出項目を絞る、表記を見直す等が有効）と考えられる。
+        # OR条件なので、いずれかのキーワードが1件でも見つかれば結果は0件にならない。
+        # 0件ということは全キーワードが取得したページ内に見つからなかったことを
+        # 意味するため、キーワードごとの内訳を見せて原因調査の手がかりにする
+        # （表記が違う、検索結果のページ内容とキーワードが噛み合っていない等）。
         breakdown = "、".join(f"{t}: {c}件" for t, c in total_match_counts.items())
+        on_progress(f"  -> 0件でした。参考: 各抽出項目の一致件数 — {breakdown}")
         on_progress(
-            "  -> 0件でした。参考: 各抽出項目が単独で（AND条件を無視して）"
-            f"何回見つかったか — {breakdown}"
-        )
-        on_progress(
-            "  -> 0件のキーワードは、そのページに存在しない/表記が違う可能性があります。"
-            "すべて1件以上あるのにAND条件で0件の場合は、各キーワードが同じ箇所に"
-            "まとまっていないため、抽出項目を絞るか表記を調整すると改善する場合があります。"
+            "  -> すべて0件の場合、取得したページに抽出キーワードが含まれていない"
+            "（表記が違う、検索結果のページ内容と合っていない等）可能性があります。"
         )
 
     on_progress(f"完了: 合計 {len(results)} 件取得しました。")
